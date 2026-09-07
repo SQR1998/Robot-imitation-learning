@@ -94,7 +94,22 @@ class OnlineQposPostprocessor:
         self.xy_origin = None
         self.xml_file = xml_file
         self.root_body_name = root_body_name
-        self.is_x02lite = "x02lite" in str(xml_file).replace("\\", "/").lower()
+        norm_xml = str(xml_file).replace("\\", "/").lower()
+        self.is_x02lite = "x02lite" in norm_xml
+        self.is_openloong = "/openloong/" in norm_xml or "openloong" in norm_xml
+
+        # OpenLoong foot collision boxes from assets/openloong/AzureLoong.xml.
+        # center and half-size are expressed in each ankle-roll body's local frame.
+        self._openloong_foot_boxes = {
+            "Link_ankle_r_roll": (
+                np.array([0.0475046136, 0.0000826669, -0.0265453104], dtype=np.float32),
+                np.array([0.1225, 0.0400, 0.0435], dtype=np.float32),
+            ),
+            "Link_ankle_l_roll": (
+                np.array([0.0475000000, 0.0012208642, -0.0272239877], dtype=np.float32),
+                np.array([0.1225, 0.0402, 0.0442], dtype=np.float32),
+            ),
+        }
 
         device = _resolve_torch_device(torch_device)
         self._set_kinematics_device(device)
@@ -111,9 +126,41 @@ class OnlineQposPostprocessor:
         root_pos = torch.from_numpy(q[:3][None]).to(self.device, dtype=torch.float32)
         root_rot_xyzw = torch.from_numpy(q[3:7][[1, 2, 3, 0]][None]).to(self.device, dtype=torch.float32)
         dof_pos = torch.from_numpy(q[7:][None]).to(self.device, dtype=torch.float32)
+
         with torch.no_grad():
-            body_pos, _ = self.kinematics_model.forward_kinematics(root_pos, root_rot_xyzw, dof_pos)
-            return torch.min(body_pos[..., 2]).item()
+            body_pos, body_rot = self.kinematics_model.forward_kinematics(
+                root_pos, root_rot_xyzw, dof_pos
+            )
+
+        # For OpenLoong, align the real foot collision boxes with the floor,
+        # rather than aligning ankle/body origins with z=0.
+        if self.is_openloong:
+            foot_bottoms = []
+
+            for body_name, (local_center, half_size) in self._openloong_foot_boxes.items():
+                idx = self.kinematics_model.get_body_idx(body_name)
+
+                pos = body_pos[0, idx].detach().cpu().numpy()
+                quat_xyzw = body_rot[0, idx].detach().cpu().numpy()
+
+                rot = R.from_quat(quat_xyzw)
+
+                # Collision-box center in world coordinates.
+                center_world = pos + rot.apply(local_center)
+
+                # Vertical half-extent of the rotated box.
+                rotmat = rot.as_matrix()
+                vertical_extent = float(
+                    np.sum(np.abs(rotmat[2, :]) * half_size)
+                )
+
+                bottom_z = float(center_world[2] - vertical_extent)
+                foot_bottoms.append(bottom_z)
+
+            # Keep a tiny 3 mm safety margin above the visual floor.
+            return min(foot_bottoms) - 0.003
+
+        return torch.min(body_pos[..., 2]).item()
 
     def process(self, qpos):
         q = np.asarray(qpos, dtype=np.float32).copy()
