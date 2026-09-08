@@ -78,6 +78,19 @@ class OnlineQposPostprocessor:
     X02LITE_R_ELBOW_QPOS_INDEX = 7 + 7
     X02LITE_R_ELBOW_SOFT_MAX_RAD = 1.35
 
+    # OpenLoong qpos indices.
+    # qpos:
+    # 0:3 root xyz
+    # 3:7 root quaternion
+    # 7:38 31 robot joints
+    OPENLOONG_R_HIP_PITCH = 28
+    OPENLOONG_R_KNEE_PITCH = 29
+    OPENLOONG_R_ANKLE_PITCH = 30
+
+    OPENLOONG_L_HIP_PITCH = 34
+    OPENLOONG_L_KNEE_PITCH = 35
+    OPENLOONG_L_ANKLE_PITCH = 36
+
     def __init__(
         self,
         xml_file,
@@ -110,6 +123,58 @@ class OnlineQposPostprocessor:
                 np.array([0.1225, 0.0402, 0.0442], dtype=np.float32),
             ),
         }
+
+        # --------------------------------------------------------
+        # OpenLoong V2.3:
+        # Guide robot knee flexion using the actual geometric knee
+        # angle measured from the human 3D skeleton.
+        # --------------------------------------------------------
+        self.openloong_knee_guidance_enable = (
+            os.environ.get(
+                "OPENLOONG_KNEE_GUIDANCE_ENABLE",
+                "0",
+            ) == "1"
+        )
+
+        # How strongly the robot knee follows the human knee.
+        self.openloong_knee_guidance_blend = float(
+            os.environ.get(
+                "OPENLOONG_KNEE_GUIDANCE_BLEND",
+                "0.75",
+            )
+        )
+
+        # Human knee flexion -> robot knee flexion multiplier.
+        self.openloong_knee_flex_gain = float(
+            os.environ.get(
+                "OPENLOONG_KNEE_FLEX_GAIN",
+                "1.0",
+            )
+        )
+
+        # Keep a tiny amount of knee flexion rather than hyperextending
+        # completely to the mechanical limit.
+        self.openloong_knee_straight_rad = float(
+            os.environ.get(
+                "OPENLOONG_KNEE_STRAIGHT_RAD",
+                "0.05",
+            )
+        )
+
+        # Smooth the human knee-angle signal.
+        self.openloong_knee_flex_smooth_alpha = float(
+            os.environ.get(
+                "OPENLOONG_KNEE_FLEX_SMOOTH_ALPHA",
+                "0.35",
+            )
+        )
+
+        self._openloong_prev_human_knee_flex = {
+            "left": None,
+            "right": None,
+        }
+
+        self._openloong_knee_guide_count = 0
 
         device = _resolve_torch_device(torch_device)
         self._set_kinematics_device(device)
@@ -162,7 +227,236 @@ class OnlineQposPostprocessor:
 
         return torch.min(body_pos[..., 2]).item()
 
-    def process(self, qpos):
+    def _human_knee_flexion(self, human_data, side):
+        """
+        Compute human knee flexion from hip-knee-foot geometry.
+
+        Straight leg:
+            flexion ~= 0 rad
+
+        Bent leg:
+            flexion > 0 rad
+        """
+        hip_name = f"{side}_hip"
+        knee_name = f"{side}_knee"
+        foot_name = f"{side}_foot"
+
+        if (
+            human_data is None
+            or hip_name not in human_data
+            or knee_name not in human_data
+            or foot_name not in human_data
+        ):
+            return None
+
+        hip = np.asarray(
+            human_data[hip_name][0],
+            dtype=np.float64,
+        )
+        knee = np.asarray(
+            human_data[knee_name][0],
+            dtype=np.float64,
+        )
+        foot = np.asarray(
+            human_data[foot_name][0],
+            dtype=np.float64,
+        )
+
+        thigh = hip - knee
+        shank = foot - knee
+
+        n1 = float(np.linalg.norm(thigh))
+        n2 = float(np.linalg.norm(shank))
+
+        if n1 < 1e-8 or n2 < 1e-8:
+            return None
+
+        cosine = float(
+            np.dot(thigh, shank) / (n1 * n2)
+        )
+        cosine = float(np.clip(cosine, -1.0, 1.0))
+
+        inner_angle = float(np.arccos(cosine))
+
+        # Straight leg -> inner angle = pi -> flexion = 0.
+        flexion = float(np.pi - inner_angle)
+
+        return max(0.0, flexion)
+
+
+    def _apply_openloong_human_knee_guidance(
+        self,
+        q,
+        human_data,
+    ):
+        if (
+            not self.is_openloong
+            or not self.openloong_knee_guidance_enable
+            or human_data is None
+        ):
+            return q
+
+        configs = {
+            "right": (
+                self.OPENLOONG_R_HIP_PITCH,
+                self.OPENLOONG_R_KNEE_PITCH,
+                self.OPENLOONG_R_ANKLE_PITCH,
+            ),
+            "left": (
+                self.OPENLOONG_L_HIP_PITCH,
+                self.OPENLOONG_L_KNEE_PITCH,
+                self.OPENLOONG_L_ANKLE_PITCH,
+            ),
+        }
+
+        debug_values = {}
+
+        for side, (
+            hip_idx,
+            knee_idx,
+            ankle_idx,
+        ) in configs.items():
+
+            flex = self._human_knee_flexion(
+                human_data,
+                side,
+            )
+
+            if flex is None:
+                continue
+
+            prev = self._openloong_prev_human_knee_flex[
+                side
+            ]
+
+            alpha = float(
+                np.clip(
+                    self.openloong_knee_flex_smooth_alpha,
+                    0.0,
+                    1.0,
+                )
+            )
+
+            if prev is not None:
+                flex = (
+                    alpha * flex
+                    + (1.0 - alpha) * prev
+                )
+
+            self._openloong_prev_human_knee_flex[
+                side
+            ] = flex
+
+            # OpenLoong knee bends in the negative direction.
+            target_knee = -(
+                self.openloong_knee_straight_rad
+                + self.openloong_knee_flex_gain * flex
+            )
+
+            # Robot knee mechanical range.
+            target_knee = float(
+                np.clip(
+                    target_knee,
+                    -2.30,
+                    0.0,
+                )
+            )
+
+            old_knee = float(q[knee_idx])
+
+            # V2.3 initially only corrects excessive crouching.
+            # If IK is already straighter than the human target,
+            # keep the IK result.
+            if target_knee <= old_knee:
+                debug_values[side] = (
+                    flex,
+                    old_knee,
+                    old_knee,
+                )
+                continue
+
+            blend = float(
+                np.clip(
+                    self.openloong_knee_guidance_blend,
+                    0.0,
+                    1.0,
+                )
+            )
+
+            new_knee = (
+                old_knee
+                + blend * (target_knee - old_knee)
+            )
+
+            delta = new_knee - old_knee
+
+            # Preserve the approximate sagittal-chain orientation:
+            #
+            # hip + knee + ankle ~= constant
+            #
+            # When knee is straightened (+delta), split the opposite
+            # compensation equally between hip and ankle.
+            q[knee_idx] = new_knee
+            q[hip_idx] -= 0.5 * delta
+            q[ankle_idx] -= 0.5 * delta
+
+            # Mechanical limits from AzureLoong.xml.
+            q[hip_idx] = np.clip(
+                q[hip_idx],
+                -0.7854,
+                1.8326,
+            )
+
+            q[knee_idx] = np.clip(
+                q[knee_idx],
+                -2.35619,
+                0.08727,
+            )
+
+            q[ankle_idx] = np.clip(
+                q[ankle_idx],
+                -0.47,
+                0.87,
+            )
+
+            debug_values[side] = (
+                flex,
+                old_knee,
+                float(q[knee_idx]),
+            )
+
+        self._openloong_knee_guide_count += 1
+
+        if (
+            self._openloong_knee_guide_count == 1
+            or self._openloong_knee_guide_count % 60 == 0
+        ):
+            if debug_values:
+                parts = []
+
+                for side in ("right", "left"):
+                    if side not in debug_values:
+                        continue
+
+                    flex, old_knee, new_knee = (
+                        debug_values[side]
+                    )
+
+                    parts.append(
+                        f"{side}: "
+                        f"human_flex={np.degrees(flex):.1f}deg "
+                        f"knee={old_knee:.3f}->{new_knee:.3f}"
+                    )
+
+                print(
+                    "[Stream] OpenLoong human-knee guidance | "
+                    + " | ".join(parts)
+                )
+
+        return q
+
+
+    def process(self, qpos, human_data=None):
         q = np.asarray(qpos, dtype=np.float32).copy()
 
         if self.prev_qpos is not None and self.smooth_alpha < 0.999:
@@ -177,6 +471,12 @@ class OnlineQposPostprocessor:
             q[3:7] = quat
 
             q[7:] = _exp_smooth(q[7:], self.prev_qpos[7:], self.smooth_alpha)
+
+        if self.is_openloong:
+            q = self._apply_openloong_human_knee_guidance(
+                q,
+                human_data,
+            )
 
         if self.height_adjust:
             try:

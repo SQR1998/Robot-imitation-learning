@@ -1729,7 +1729,10 @@ def run_stream_mt(
         ik_ms = (time.perf_counter() - _t0_ik) * 1000
 
         _t0_post = time.perf_counter()
-        qp = state["postprocessor"].process(qp)
+        qp = state["postprocessor"].process(
+            qp,
+            human_data=sf,
+        )
         post_ms = (time.perf_counter() - _t0_post) * 1000
 
         if not os.environ.get("BENCH_DISABLE_QUAT_CLAMP", "0") == "1" and state.get("prev_qpos_quat") is not None:

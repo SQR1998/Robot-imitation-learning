@@ -68,15 +68,53 @@ class GeneralMotionRetargeting:
         if verbose:
             print("Use IK config: ", IK_CONFIG_DICT[src_human][tgt_robot])
         
-        # compute the scale ratio based on given human height and the assumption in the IK config
+        # Compute human-to-robot body scale.
+        #
+        # For OpenLoong we use segmented normalization:
+        # - upper body keeps the original V1 scaling;
+        # - lower-body targets use canonical-height normalization.
+        #
+        # This lets the legs use more of OpenLoong's available leg length
+        # without stretching the arms and pushing the wrists into limits.
         if actual_human_height is not None:
-            ratio = actual_human_height / ik_config["human_height_assumption"]
+            assumed_height = float(ik_config["human_height_assumption"])
+
+            default_ratio = actual_human_height / assumed_height
+            leg_ratio = assumed_height / actual_human_height
+
+            openloong_leg_bodies = {
+                "left_hip",
+                "right_hip",
+                "left_knee",
+                "right_knee",
+                "left_foot",
+                "right_foot",
+            }
+
+            is_openloong = str(tgt_robot).strip().lower() in (
+                "openloong",
+                "loong",
+            )
+
+            for key in ik_config["human_scale_table"].keys():
+                if is_openloong and key in openloong_leg_bodies:
+                    ratio = leg_ratio
+                else:
+                    ratio = default_ratio
+
+                ik_config["human_scale_table"][key] *= ratio
+
+            if is_openloong:
+                print(
+                    "[GMR] OpenLoong segmented height normalization: "
+                    f"actual={actual_human_height:.4f} m, "
+                    f"assumed={assumed_height:.4f} m, "
+                    f"upper_ratio={default_ratio:.4f}, "
+                    f"leg_ratio={leg_ratio:.4f}"
+                )
         else:
-            ratio = 1.0
-            
-        # adjust the human scale table
-        for key in ik_config["human_scale_table"].keys():
-            ik_config["human_scale_table"][key] = ik_config["human_scale_table"][key] * ratio
+            # No detected human height: keep the calibration table unchanged.
+            pass
     
 
         # used for retargeting
