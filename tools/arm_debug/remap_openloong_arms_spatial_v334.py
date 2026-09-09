@@ -1,0 +1,3151 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import csv
+import math
+import sys
+from pathlib import Path
+
+import mujoco as mj
+import numpy as np
+import smplx
+import torch
+from scipy.optimize import least_squares
+from scipy.spatial.transform import Rotation as R
+from smplx.joint_names import JOINT_NAMES
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from general_motion_retargeting import ROBOT_XML_DICT, RobotMotionViewer
+
+
+DEFAULT_BODY_CSV = (
+    ROOT
+    / "output/openloong_v2_kneeguide/csv/openloong/live_motion.csv"
+)
+DEFAULT_SMPLX = (
+    ROOT
+    / "output/openloong_v2_kneeguide/stream_demo/gmr_smplx_results.npz"
+)
+DEFAULT_HAND_DIR_CSV = (
+    ROOT
+    / "output/openloong_hand_full_filter_v6/hand_full_filtered_v6.csv"
+)
+DEFAULT_PALM_ROLL_CSV = (
+    ROOT
+    / "output/openloong_palm_roll_v2/palm_roll_v2.csv"
+)
+DEFAULT_OUT_DIR = ROOT / "output/openloong_v334_natural_posture"
+SMPLX_FOLDER = ROOT / "assets/body_models"
+
+ARM_JOINTS = {
+    "left": [f"J_arm_l_{i:02d}" for i in range(1, 8)],
+    "right": [f"J_arm_r_{i:02d}" for i in range(1, 8)],
+}
+ARM_BODY = {
+    "left": {
+        "shoulder": "Link_arm_l_01",
+        "elbow": "Link_arm_l_04",
+        "wrist": "Link_arm_l_07",
+    },
+    "right": {
+        "shoulder": "Link_arm_r_01",
+        "elbow": "Link_arm_r_04",
+        "wrist": "Link_arm_r_07",
+    },
+}
+HUMAN_JOINTS = (
+    "pelvis",
+    "left_shoulder",
+    "right_shoulder",
+    "left_elbow",
+    "right_elbow",
+    "left_wrist",
+    "right_wrist",
+)
+
+# Validated OpenLoong hand long-axis convention from the earlier POC.
+FINGER_LOCAL = {
+    "left": np.array([0.0, +1.0, 0.0], dtype=np.float64),
+    "right": np.array([0.0, -1.0, 0.0], dtype=np.float64),
+}
+
+# V3.1.3 visual calibration showed that OpenLoong's real palm-facing
+# normal is the local +X axis of Link_arm_[lr]_07.
+PALM_LOCAL = {
+    "left": np.array([+1.0, 0.0, 0.0], dtype=np.float64),
+    "right": np.array([+1.0, 0.0, 0.0], dtype=np.float64),
+}
+
+# MuJoCo world ground-down.
+WORLD_DOWN = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+
+
+def unit(v: np.ndarray, fallback: np.ndarray | None = None) -> np.ndarray:
+    v = np.asarray(v, dtype=np.float64)
+    n = float(np.linalg.norm(v))
+    if n > 1e-10:
+        return v / n
+    if fallback is None:
+        return np.zeros_like(v)
+    return unit(np.asarray(fallback, dtype=np.float64))
+
+
+def rotate_about_axis(
+    vector: np.ndarray,
+    axis: np.ndarray,
+    angle_rad: float,
+) -> np.ndarray:
+    """Rodrigues rotation; used only to lift V6's 2-D forearm-relative angle."""
+    v = np.asarray(vector, dtype=np.float64)
+    k = unit(np.asarray(axis, dtype=np.float64), np.array([1.0, 0.0, 0.0]))
+    c = math.cos(float(angle_rad))
+    s = math.sin(float(angle_rad))
+    return (
+        v * c
+        + np.cross(k, v) * s
+        + k * np.dot(k, v) * (1.0 - c)
+    )
+
+
+def project_perp(
+    vector: np.ndarray,
+    axis: np.ndarray,
+    fallback: np.ndarray,
+) -> np.ndarray:
+    """Project vector onto the plane perpendicular to axis."""
+    a = unit(axis, np.array([1.0, 0.0, 0.0]))
+    v = np.asarray(vector, dtype=np.float64)
+    out = v - float(np.dot(v, a)) * a
+
+    if float(np.linalg.norm(out)) < 1e-8:
+        fb = np.asarray(fallback, dtype=np.float64)
+        out = fb - float(np.dot(fb, a)) * a
+
+    return unit(out, np.array([0.0, 0.0, -1.0]))
+
+
+def vector_angle_deg(a: np.ndarray, b: np.ndarray) -> float:
+    """Unsigned angle between two vectors in degrees."""
+    aa = unit(np.asarray(a, dtype=np.float64), np.array([1.0, 0.0, 0.0]))
+    bb = unit(np.asarray(b, dtype=np.float64), np.array([1.0, 0.0, 0.0]))
+    c = float(np.clip(np.dot(aa, bb), -1.0, 1.0))
+    return float(np.rad2deg(np.arccos(c)))
+
+
+def angle_deg(a: np.ndarray, b: np.ndarray) -> float:
+    a = unit(a)
+    b = unit(b)
+    d = float(np.clip(np.dot(a, b), -1.0, 1.0))
+    return float(np.rad2deg(np.arccos(d)))
+
+
+def csv_row_to_qpos(row: np.ndarray) -> np.ndarray:
+    q = np.asarray(row, dtype=np.float64).copy()
+    q[3:7] = row[[6, 3, 4, 5]]  # CSV xyzw -> MuJoCo wxyz
+    return q
+
+
+def qpos_to_csv_row(qpos: np.ndarray) -> np.ndarray:
+    q = np.asarray(qpos, dtype=np.float64)
+    row = q.copy()
+    row[3:7] = q[3:7][[1, 2, 3, 0]]  # MuJoCo wxyz -> CSV xyzw
+    return row
+
+
+def body_rot(data: mj.MjData, body_id: int) -> np.ndarray:
+    return np.asarray(data.xmat[body_id], dtype=np.float64).reshape(3, 3)
+
+
+def segment_distance(
+    p1: np.ndarray,
+    q1: np.ndarray,
+    p2: np.ndarray,
+    q2: np.ndarray,
+) -> float:
+    """Shortest Euclidean distance between two 3-D line segments."""
+    p1 = np.asarray(p1, dtype=np.float64)
+    q1 = np.asarray(q1, dtype=np.float64)
+    p2 = np.asarray(p2, dtype=np.float64)
+    q2 = np.asarray(q2, dtype=np.float64)
+
+    d1 = q1 - p1
+    d2 = q2 - p2
+    r = p1 - p2
+    a = float(np.dot(d1, d1))
+    e = float(np.dot(d2, d2))
+    eps = 1e-12
+
+    if a <= eps and e <= eps:
+        return float(np.linalg.norm(p1 - p2))
+
+    if a <= eps:
+        s = 0.0
+        t = float(np.clip(np.dot(d2, r) / e, 0.0, 1.0))
+    else:
+        c = float(np.dot(d1, r))
+        if e <= eps:
+            t = 0.0
+            s = float(np.clip(-c / a, 0.0, 1.0))
+        else:
+            b = float(np.dot(d1, d2))
+            denom = a * e - b * b
+            if abs(denom) > eps:
+                s = float(
+                    np.clip(
+                        (b * np.dot(d2, r) - c * e) / denom,
+                        0.0,
+                        1.0,
+                    )
+                )
+            else:
+                s = 0.0
+            t = float((b * s + np.dot(d2, r)) / e)
+            if t < 0.0:
+                t = 0.0
+                s = float(np.clip(-c / a, 0.0, 1.0))
+            elif t > 1.0:
+                t = 1.0
+                s = float(np.clip((b - c) / a, 0.0, 1.0))
+
+    c1 = p1 + d1 * s
+    c2 = p2 + d2 * t
+    return float(np.linalg.norm(c1 - c2))
+
+
+def signed_distance_to_obb(
+    point: np.ndarray,
+    center: np.ndarray,
+    basis: np.ndarray,
+    half: np.ndarray,
+) -> float:
+    """SDF of an oriented box. Positive outside, negative inside."""
+    local = basis.T @ (np.asarray(point, dtype=np.float64) - center)
+    q = np.abs(local) - half
+    outside = float(np.linalg.norm(np.maximum(q, 0.0)))
+    inside = float(min(max(q[0], q[1], q[2]), 0.0))
+    return outside + inside
+
+
+class OpenLoongArmSpatialRetargeter:
+    def __init__(self, model: mj.MjModel, args: argparse.Namespace):
+        self.model = model
+        self.data = mj.MjData(model)
+        self.args = args
+
+        self.base_body = self._body_id("base_link")
+        self.body_ids = {
+            side: {
+                key: self._body_id(name)
+                for key, name in ARM_BODY[side].items()
+            }
+            for side in ("left", "right")
+        }
+
+        # Never hard-code CSV/qpos indices. Read them from the MuJoCo model.
+        self.arm_qpos = {
+            side: [self._joint_qpos_index(name) for name in ARM_JOINTS[side]]
+            for side in ("left", "right")
+        }
+        self.arm_qpos_all = self.arm_qpos["left"] + self.arm_qpos["right"]
+
+        self.lower, self.upper = self._arm_bounds()
+
+        # V3.0.3 branch-continuity preference.
+        per_arm_temporal_scale = np.array(
+            [1.0, 1.0, 1.4, 1.0, 1.5, 2.0, 2.0],
+            dtype=np.float64,
+        )
+        self.temporal_scale = np.concatenate(
+            [per_arm_temporal_scale, per_arm_temporal_scale]
+        )
+
+        # Soft joint-limit margins in radians.
+        per_arm_limit_margin = np.array(
+            [0.10, 0.10, 0.14, 0.10, 0.14, 0.18, 0.16],
+            dtype=np.float64,
+        )
+        self.limit_margin = np.concatenate(
+            [per_arm_limit_margin, per_arm_limit_margin]
+        )
+
+        self.arm_body_sets = self._build_arm_body_sets()
+        self.upper_len, self.forearm_len = self._measure_robot_arm_lengths()
+
+        self.prev_solution: np.ndarray | None = None
+        self.prev_output_arm: np.ndarray | None = None
+        self.prev_delta: np.ndarray | None = None
+
+        # V3.3.4 natural-posture anchor.
+        # The validated body/GMR arm pose is NOT copied directly.  Instead it
+        # is low-pass filtered and used only as a soft preference on redundant
+        # twist-like DoFs.  This keeps the solver on a visually natural branch
+        # without sacrificing wrist/elbow tracking or continuity.
+        self.posture_anchor: np.ndarray | None = None
+
+        per_arm_twist_scale = np.array(
+            [
+                0.00,  # J01: leave gross shoulder placement free
+                0.15,  # J02: very light posture cue
+                1.00,  # J03: strong redundant shoulder twist cue
+                0.00,  # J04: elbow flex handled by extension guidance
+                1.20,  # J05: strongest forearm/arm twist cue
+                0.20,  # J06: light wrist posture cue
+                0.05,  # J07: almost free; palm/finger may use it
+            ],
+            dtype=np.float64,
+        )
+        self.twist_posture_scale = np.concatenate(
+            [per_arm_twist_scale, per_arm_twist_scale]
+        )
+
+        self.twist_diag_mask_left = np.array(
+            [False, False, True, False, True, False, False,
+             False, False, False, False, False, False, False],
+            dtype=bool,
+        )
+        self.twist_diag_mask_right = np.array(
+            [False, False, False, False, False, False, False,
+             False, False, True, False, True, False, False],
+            dtype=bool,
+        )
+
+        # V3.3 continuity-first hard trust region INSIDE the IK solve.
+        # First 4 joints per arm move the visible whole arm most strongly;
+        # distal wrist/orientation joints are allowed a little more freedom.
+        per_arm_hard_step = np.array(
+            [
+                self.args.hard_step_proximal,
+                self.args.hard_step_proximal,
+                self.args.hard_step_proximal,
+                self.args.hard_step_proximal,
+                self.args.hard_step_distal,
+                self.args.hard_step_distal,
+                self.args.hard_step_distal,
+            ],
+            dtype=np.float64,
+        )
+        self.hard_step = np.concatenate(
+            [per_arm_hard_step, per_arm_hard_step]
+        )
+
+        # z order is LEFT 7 joints followed by RIGHT 7 joints.
+        self.proximal_mask = np.array(
+            [
+                True, True, True, True, False, False, False,
+                True, True, True, True, False, False, False,
+            ],
+            dtype=bool,
+        )
+
+        # J_arm_[lr]_04 is the elbow flexion joint in the 14D solve vector.
+        self.elbow_z_index = {"left": 3, "right": 10}
+
+    def _body_id(self, name: str) -> int:
+        idx = mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_BODY, name)
+        if idx < 0:
+            raise RuntimeError(f"MuJoCo body not found: {name}")
+        return int(idx)
+
+    def _joint_qpos_index(self, name: str) -> int:
+        jid = mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_JOINT, name)
+        if jid < 0:
+            raise RuntimeError(f"MuJoCo joint not found: {name}")
+        qidx = int(self.model.jnt_qposadr[jid])
+        if qidx < 7:
+            raise RuntimeError(f"Unexpected arm qpos index for {name}: {qidx}")
+        return qidx
+
+    def _arm_bounds(self) -> tuple[np.ndarray, np.ndarray]:
+        lower = []
+        upper = []
+        for name in ARM_JOINTS["left"] + ARM_JOINTS["right"]:
+            jid = mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_JOINT, name)
+            if jid < 0:
+                raise RuntimeError(name)
+            if bool(self.model.jnt_limited[jid]):
+                lo, hi = self.model.jnt_range[jid]
+            else:
+                lo, hi = -np.pi, np.pi
+            lower.append(float(lo))
+            upper.append(float(hi))
+        return np.asarray(lower), np.asarray(upper)
+
+    def _build_arm_body_sets(self) -> dict[str, set[int]]:
+        out = {"left": set(), "right": set()}
+        for bid in range(int(self.model.nbody)):
+            name = mj.mj_id2name(self.model, mj.mjtObj.mjOBJ_BODY, bid) or ""
+            if name.startswith("Link_arm_l_"):
+                out["left"].add(bid)
+            elif name.startswith("Link_arm_r_"):
+                out["right"].add(bid)
+        return out
+
+    def _measure_robot_arm_lengths(
+        self,
+    ) -> tuple[dict[str, float], dict[str, float]]:
+        q = np.asarray(self.model.qpos0, dtype=np.float64).copy()
+        self.data.qpos[:] = q
+        mj.mj_forward(self.model, self.data)
+
+        upper = {}
+        fore = {}
+        for side in ("left", "right"):
+            s = np.asarray(
+                self.data.xpos[self.body_ids[side]["shoulder"]],
+                dtype=np.float64,
+            )
+            e = np.asarray(
+                self.data.xpos[self.body_ids[side]["elbow"]],
+                dtype=np.float64,
+            )
+            w = np.asarray(
+                self.data.xpos[self.body_ids[side]["wrist"]],
+                dtype=np.float64,
+            )
+            upper[side] = float(np.linalg.norm(e - s))
+            fore[side] = float(np.linalg.norm(w - e))
+        return upper, fore
+
+    def set_q(self, q: np.ndarray) -> None:
+        self.data.qpos[:] = q
+        mj.mj_forward(self.model, self.data)
+
+    def endpoints(self) -> dict[str, dict[str, np.ndarray]]:
+        return {
+            side: {
+                key: np.asarray(self.data.xpos[bid], dtype=np.float64).copy()
+                for key, bid in self.body_ids[side].items()
+            }
+            for side in ("left", "right")
+        }
+
+    def robot_torso_frame(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        ep = self.endpoints()
+        left_s = ep["left"]["shoulder"]
+        right_s = ep["right"]["shoulder"]
+        shoulder_center = 0.5 * (left_s + right_s)
+        base = np.asarray(
+            self.data.xpos[self.base_body],
+            dtype=np.float64,
+        ).copy()
+
+        lateral = unit(
+            left_s - right_s,
+            np.array([0.0, 1.0, 0.0]),
+        )
+        up = unit(
+            shoulder_center - base,
+            np.array([0.0, 0.0, 1.0]),
+        )
+        forward = unit(
+            np.cross(lateral, up),
+            np.array([1.0, 0.0, 0.0]),
+        )
+
+        base_forward = (
+            body_rot(self.data, self.base_body)
+            @ np.array([1.0, 0.0, 0.0])
+        )
+        if float(np.dot(forward, base_forward)) < 0.0:
+            forward = -forward
+
+        up = unit(np.cross(forward, lateral), up)
+        basis = np.column_stack([forward, lateral, up])
+
+        torso_center = 0.5 * (base + shoulder_center)
+        shoulder_width = float(np.linalg.norm(left_s - right_s))
+        torso_height = float(np.linalg.norm(shoulder_center - base))
+
+        half = np.array(
+            [
+                self.args.torso_half_x,
+                max(
+                    0.10,
+                    0.5
+                    * shoulder_width
+                    * self.args.torso_half_y_scale,
+                ),
+                max(
+                    0.15,
+                    0.5 * torso_height
+                    + self.args.torso_z_padding,
+                ),
+            ],
+            dtype=np.float64,
+        )
+        return torso_center, basis, half, shoulder_center
+
+    @staticmethod
+    def human_torso_frame(
+        human: dict[str, np.ndarray],
+    ) -> np.ndarray:
+        ls = human["left_shoulder"]
+        rs = human["right_shoulder"]
+        pelvis = human["pelvis"]
+        center = 0.5 * (ls + rs)
+
+        # After the checkpoint's y-up -> z-up conversion:
+        # lateral = human right->left, up = pelvis->shoulder center,
+        # forward = lateral x up.
+        lateral = unit(
+            ls - rs,
+            np.array([1.0, 0.0, 0.0]),
+        )
+        up = unit(
+            center - pelvis,
+            np.array([0.0, 0.0, 1.0]),
+        )
+        forward = unit(
+            np.cross(lateral, up),
+            np.array([0.0, -1.0, 0.0]),
+        )
+        up = unit(np.cross(forward, lateral), up)
+        return np.column_stack([forward, lateral, up])
+
+    def build_targets(
+        self,
+        human: dict[str, np.ndarray],
+        hand_relative_deg: dict[str, float],
+        palm_roll_deg: dict[str, float],
+    ) -> tuple[
+        dict[str, dict[str, np.ndarray]],
+        tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    ]:
+        ep = self.endpoints()
+        human_basis = self.human_torso_frame(human)
+        torso = self.robot_torso_frame()
+        _, robot_basis, _, _ = torso
+
+        targets: dict[str, dict[str, np.ndarray]] = {}
+
+        for side in ("left", "right"):
+            hs = human[f"{side}_shoulder"]
+            he = human[f"{side}_elbow"]
+            hw = human[f"{side}_wrist"]
+
+            # Keep human arm direction in the torso-local coordinate system,
+            # but reconstruct the target with OpenLoong's own limb lengths.
+            upper_h = unit(he - hs)
+            fore_h = unit(hw - he)
+
+            # V3.3.2: detect whether the HUMAN arm is close to straight.
+            human_elbow_bend_deg = vector_angle_deg(upper_h, fore_h)
+
+            start_deg = float(self.args.elbow_extension_start_deg)
+            full_deg = float(self.args.elbow_extension_full_deg)
+            if start_deg <= full_deg:
+                raise ValueError(
+                    "--elbow-extension-start-deg must be > "
+                    "--elbow-extension-full-deg"
+                )
+
+            extension_gate = float(
+                np.clip(
+                    (start_deg - human_elbow_bend_deg)
+                    / (start_deg - full_deg),
+                    0.0,
+                    1.0,
+                )
+            )
+
+            elbow_flex_target_rad = float(
+                np.clip(
+                    np.deg2rad(human_elbow_bend_deg)
+                    * self.args.elbow_flex_scale,
+                    0.0,
+                    self.args.elbow_extension_target_max_rad,
+                )
+            )
+
+            upper_local = human_basis.T @ upper_h
+            fore_local = human_basis.T @ fore_h
+
+            upper_robot = unit(robot_basis @ upper_local)
+            fore_robot = unit(robot_basis @ fore_local)
+
+            s_robot = ep[side]["shoulder"]
+            elbow_target = (
+                s_robot
+                + upper_robot
+                * self.upper_len[side]
+                * self.args.upper_length_scale
+            )
+            wrist_target = (
+                elbow_target
+                + fore_robot
+                * self.forearm_len[side]
+                * self.args.forearm_length_scale
+            )
+
+            # V3.2: keep the validated V6 detector unchanged.
+            # V6 gives a 2-D hand-vs-forearm angle. We lift that angle into
+            # the robot torso frame by rotating the mapped 3-D forearm around
+            # the torso forward axis. No arm_06/07 post-hoc patch is used.
+            rel_deg = float(hand_relative_deg[side])
+            finger_target = unit(
+                rotate_about_axis(
+                    fore_robot,
+                    robot_basis[:, 0],
+                    np.deg2rad(
+                        self.args.hand_dir_sign * rel_deg
+                    ),
+                ),
+                fore_robot,
+            )
+
+            # V3.2 Palm Roll V2:
+            # 0 deg means "palm-down reference" and +/- angle means roll
+            # around the hand/finger long axis.  Build the palm target from
+            # the SAME finger_target so finger and palm form one coherent
+            # target orientation instead of two unrelated constraints.
+            down_ref = project_perp(
+                WORLD_DOWN,
+                finger_target,
+                robot_basis[:, 0],
+            )
+
+            roll_sign = (
+                self.args.palm_roll_sign_left
+                if side == "left"
+                else self.args.palm_roll_sign_right
+            )
+
+            roll_deg = float(
+                palm_roll_deg[side]
+            )
+
+            palm_target = unit(
+                rotate_about_axis(
+                    down_ref,
+                    finger_target,
+                    np.deg2rad(
+                        roll_sign
+                        * roll_deg
+                    ),
+                ),
+                down_ref,
+            )
+
+            # Numerical cleanup: palm target must remain perpendicular to
+            # finger_target, just like the two local axes on the rigid hand.
+            palm_target = project_perp(
+                palm_target,
+                finger_target,
+                down_ref,
+            )
+
+            targets[side] = {
+                "shoulder": s_robot.copy(),
+                "elbow": elbow_target,
+                "wrist": wrist_target,
+                "finger_dir": finger_target,
+                "palm_dir": palm_target,
+                "palm_roll_deg": roll_deg,
+                "human_elbow_bend_deg": human_elbow_bend_deg,
+                "elbow_flex_target_rad": elbow_flex_target_rad,
+                "extension_gate": extension_gate,
+            }
+
+        # Collision safety is applied to spatial targets BEFORE IK.
+        self.project_targets_collision_safe(targets, torso)
+        return targets, torso
+
+    def _project_point_outside_torso(
+        self,
+        point: np.ndarray,
+        side: str,
+        torso: tuple[
+            np.ndarray,
+            np.ndarray,
+            np.ndarray,
+            np.ndarray,
+        ],
+        margin: float,
+        prefer_side: bool,
+    ) -> np.ndarray:
+        center, basis, half, _ = torso
+        local = basis.T @ (point - center)
+        expanded = half + float(margin)
+
+        if not np.all(np.abs(local) < expanded):
+            return point
+
+        side_sign = 1.0 if side == "left" else -1.0
+        eps = 0.003
+
+        # Preserve front/back intent: a hand behind the back is projected to
+        # the back face, not forcibly teleported in front of the chest.
+        x_sign = 1.0 if local[0] >= 0.0 else -1.0
+
+        x_candidate = local.copy()
+        x_candidate[0] = x_sign * (expanded[0] + eps)
+
+        y_candidate = local.copy()
+        y_candidate[1] = side_sign * (expanded[1] + eps)
+
+        dx = float(np.linalg.norm(x_candidate - local))
+        dy = float(np.linalg.norm(y_candidate - local))
+
+        if prefer_side:
+            choose_y = dy * 0.88 <= dx * 1.12
+        else:
+            choose_y = dy <= dx * 1.06
+
+        chosen = y_candidate if choose_y else x_candidate
+        return center + basis @ chosen
+
+    def project_targets_collision_safe(
+        self,
+        targets: dict[str, dict[str, np.ndarray]],
+        torso: tuple[
+            np.ndarray,
+            np.ndarray,
+            np.ndarray,
+            np.ndarray,
+        ],
+    ) -> None:
+        # 1) Torso clearance before IK.
+        for side in ("left", "right"):
+            targets[side]["elbow"] = (
+                self._project_point_outside_torso(
+                    targets[side]["elbow"],
+                    side,
+                    torso,
+                    self.args.elbow_torso_margin,
+                    prefer_side=True,
+                )
+            )
+            targets[side]["wrist"] = (
+                self._project_point_outside_torso(
+                    targets[side]["wrist"],
+                    side,
+                    torso,
+                    self.args.hand_torso_margin,
+                    prefer_side=False,
+                )
+            )
+
+        # 2) Hand-hand target clearance.
+        wl = targets["left"]["wrist"]
+        wr = targets["right"]["wrist"]
+        delta = wl - wr
+        dist = float(np.linalg.norm(delta))
+
+        if dist < self.args.hand_hand_min:
+            if dist < 1e-8:
+                direction = torso[1][:, 1]
+            else:
+                direction = delta / dist
+
+            push = 0.5 * (
+                self.args.hand_hand_min
+                - dist
+                + 0.003
+            )
+            targets["left"]["wrist"] = wl + direction * push
+            targets["right"]["wrist"] = wr - direction * push
+
+        # 3) Forearm target crossing/clearance.
+        el = targets["left"]["elbow"]
+        er = targets["right"]["elbow"]
+        wl = targets["left"]["wrist"]
+        wr = targets["right"]["wrist"]
+
+        fore_dist = segment_distance(
+            el,
+            wl,
+            er,
+            wr,
+        )
+
+        if fore_dist < self.args.forearm_forearm_min:
+            lateral = torso[1][:, 1]
+            push = 0.5 * (
+                self.args.forearm_forearm_min
+                - fore_dist
+                + 0.003
+            )
+            targets["left"]["wrist"] = wl + lateral * push
+            targets["right"]["wrist"] = wr - lateral * push
+
+        # Separation can move a wrist toward the torso, so recheck.
+        for side in ("left", "right"):
+            targets[side]["wrist"] = (
+                self._project_point_outside_torso(
+                    targets[side]["wrist"],
+                    side,
+                    torso,
+                    self.args.hand_torso_margin,
+                    prefer_side=False,
+                )
+            )
+
+    def _set_arm_vector(
+        self,
+        q: np.ndarray,
+        z: np.ndarray,
+    ) -> np.ndarray:
+        out = q.copy()
+        out[self.arm_qpos_all] = z
+        return out
+
+    def _arm_vector(
+        self,
+        q: np.ndarray,
+    ) -> np.ndarray:
+        return np.asarray(
+            q[self.arm_qpos_all],
+            dtype=np.float64,
+        ).copy()
+
+    def _actual_collision_depth(self) -> float:
+        total_sq = 0.0
+        all_arm = (
+            self.arm_body_sets["left"]
+            | self.arm_body_sets["right"]
+        )
+
+        for i in range(int(self.data.ncon)):
+            con = self.data.contact[i]
+
+            b1 = int(
+                self.model.geom_bodyid[
+                    int(con.geom1)
+                ]
+            )
+            b2 = int(
+                self.model.geom_bodyid[
+                    int(con.geom2)
+                ]
+            )
+
+            # Ignore world/floor here; V3.0 focuses on arm-body/self collision.
+            if b1 == 0 or b2 == 0:
+                continue
+
+            if b1 not in all_arm and b2 not in all_arm:
+                continue
+
+            depth = max(
+                0.0,
+                -float(con.dist),
+            )
+            total_sq += depth * depth
+
+        return math.sqrt(total_sq)
+
+    def _collision_contact_count(self) -> int:
+        count = 0
+        all_arm = (
+            self.arm_body_sets["left"]
+            | self.arm_body_sets["right"]
+        )
+
+        for i in range(int(self.data.ncon)):
+            con = self.data.contact[i]
+
+            b1 = int(
+                self.model.geom_bodyid[
+                    int(con.geom1)
+                ]
+            )
+            b2 = int(
+                self.model.geom_bodyid[
+                    int(con.geom2)
+                ]
+            )
+
+            if b1 == 0 or b2 == 0:
+                continue
+
+            if b1 not in all_arm and b2 not in all_arm:
+                continue
+
+            if float(con.dist) < 0.0:
+                count += 1
+
+        return count
+
+    def solve(
+        self,
+        body_q: np.ndarray,
+        human: dict[str, np.ndarray],
+        hand_relative_deg: dict[str, float],
+        palm_roll_deg: dict[str, float],
+    ) -> tuple[np.ndarray, dict[str, float]]:
+        # Important ordering:
+        # 1. body_q is the already-validated final body pose;
+        # 2. freeze it;
+        # 3. discard/re-solve all 14 arm qpos values jointly.
+        self.set_q(body_q)
+
+        original_arm = self._arm_vector(body_q)
+
+        # V3.3.4: slowly varying natural-posture reference.
+        # alpha=1 would copy the current GMR arm every frame; a small alpha
+        # instead provides only a stable "which redundant branch looks normal"
+        # cue and does not re-introduce frame-to-frame GMR jitter.
+        if self.posture_anchor is None:
+            posture_anchor = original_arm.copy()
+        else:
+            alpha = float(self.args.twist_posture_alpha)
+            posture_anchor = (
+                (1.0 - alpha) * self.posture_anchor
+                + alpha * original_arm
+            )
+
+        targets, torso = self.build_targets(
+            human,
+            hand_relative_deg,
+            palm_roll_deg,
+        )
+
+        # Frame 0 is fully solved too. Original GMR is only an initial guess,
+        # never a post-hoc patch target.
+        if self.prev_solution is None:
+            x0 = original_arm.copy()
+        else:
+            x0 = self.prev_solution.copy()
+
+        x0 = np.clip(
+            x0,
+            self.lower + 1e-7,
+            self.upper - 1e-7,
+        )
+
+        # V3.3 hard trust region. This is NOT post-hoc clipping:
+        # least_squares is only allowed to search a continuous neighborhood
+        # of the previous valid arm configuration.
+        if self.prev_solution is None:
+            solve_lower = self.lower.copy()
+            solve_upper = self.upper.copy()
+        else:
+            solve_lower = np.maximum(
+                self.lower,
+                self.prev_solution - self.hard_step,
+            )
+            solve_upper = np.minimum(
+                self.upper,
+                self.prev_solution + self.hard_step,
+            )
+
+        x0 = np.clip(
+            x0,
+            solve_lower + 1e-8,
+            solve_upper - 1e-8,
+        )
+
+        active_hand_scale = 1.0
+        active_palm_scale = 1.0
+
+        def residual(z: np.ndarray) -> np.ndarray:
+            q = self._set_arm_vector(
+                body_q,
+                z,
+            )
+            self.set_q(q)
+            ep = self.endpoints()
+
+            res: list[float] = []
+
+            # Spatial arm tracking.
+            for side in ("left", "right"):
+                res.extend(
+                    (
+                        self.args.elbow_weight
+                        * (
+                            ep[side]["elbow"]
+                            - targets[side]["elbow"]
+                        )
+                    ).tolist()
+                )
+                res.extend(
+                    (
+                        self.args.wrist_weight
+                        * (
+                            ep[side]["wrist"]
+                            - targets[side]["wrist"]
+                        )
+                    ).tolist()
+                )
+
+            # V3.3 V6 hand long-axis direction residual.
+            # Both hands participate in the SAME bilateral 14-DoF solve.
+            for side in ("left", "right"):
+                hand_rot = body_rot(
+                    self.data,
+                    self.body_ids[side]["wrist"],
+                )
+                finger_world = unit(
+                    hand_rot @ FINGER_LOCAL[side]
+                )
+                extension_gate = float(targets[side]["extension_gate"])
+                extension_hand_scale = (
+                    1.0
+                    - extension_gate
+                    * self.args.extension_hand_relax
+                )
+                res.extend(
+                    (
+                        self.args.hand_dir_weight
+                        * active_hand_scale
+                        * extension_hand_scale
+                        * (
+                            finger_world
+                            - targets[side]["finger_dir"]
+                        )
+                    ).tolist()
+                )
+
+            # V3.3 palm-facing residual.
+            # PALM_LOCAL (+X) was visually calibrated on OpenLoong.
+            # Palm Roll V2 supplies the time-varying roll around finger_dir;
+            # there is NO fixed WORLD_DOWN palm constraint anymore.
+            for side in ("left", "right"):
+                hand_rot = body_rot(
+                    self.data,
+                    self.body_ids[side]["wrist"],
+                )
+                palm_world = unit(
+                    hand_rot @ PALM_LOCAL[side]
+                )
+                extension_gate = float(targets[side]["extension_gate"])
+                extension_palm_scale = (
+                    1.0
+                    - extension_gate
+                    * self.args.extension_palm_relax
+                )
+                res.extend(
+                    (
+                        self.args.palm_dir_weight
+                        * active_palm_scale
+                        * extension_palm_scale
+                        * (
+                            palm_world
+                            - targets[side]["palm_dir"]
+                        )
+                    ).tolist()
+                )
+
+            # V3.3.2: when the HUMAN arm is straight, softly prefer the
+            # OpenLoong elbow (J04) to stay correspondingly extended.
+            for side in ("left", "right"):
+                gate = float(targets[side]["extension_gate"])
+                idx = self.elbow_z_index[side]
+                target_flex = float(targets[side]["elbow_flex_target_rad"])
+                res.append(
+                    self.args.elbow_extension_weight
+                    * gate
+                    * (z[idx] - target_flex)
+                )
+
+            center, basis, half, _ = torso
+
+            # Fixed-dimension torso clearance:
+            # elbow + 1/3 forearm + 2/3 forearm + wrist.
+            for side in ("left", "right"):
+                e = ep[side]["elbow"]
+                w = ep[side]["wrist"]
+
+                points = [
+                    (
+                        e,
+                        self.args.elbow_torso_margin,
+                    ),
+                    (
+                        e + (w - e) / 3.0,
+                        self.args.forearm_torso_margin,
+                    ),
+                    (
+                        e + 2.0 * (w - e) / 3.0,
+                        self.args.forearm_torso_margin,
+                    ),
+                    (
+                        w,
+                        self.args.hand_torso_margin,
+                    ),
+                ]
+
+                for p, margin in points:
+                    sd = signed_distance_to_obb(
+                        p,
+                        center,
+                        basis,
+                        half,
+                    )
+                    shortage = max(
+                        0.0,
+                        float(margin) - sd,
+                    )
+                    res.append(
+                        self.args.torso_collision_weight
+                        * shortage
+                    )
+
+            # Bilateral collision constraints are part of IK itself.
+            hand_dist = float(
+                np.linalg.norm(
+                    ep["left"]["wrist"]
+                    - ep["right"]["wrist"]
+                )
+            )
+            res.append(
+                self.args.hand_hand_weight
+                * max(
+                    0.0,
+                    self.args.hand_hand_min
+                    - hand_dist,
+                )
+            )
+
+            fore_dist = segment_distance(
+                ep["left"]["elbow"],
+                ep["left"]["wrist"],
+                ep["right"]["elbow"],
+                ep["right"]["wrist"],
+            )
+            res.append(
+                self.args.forearm_forearm_weight
+                * max(
+                    0.0,
+                    self.args.forearm_forearm_min
+                    - fore_dist,
+                )
+            )
+
+            # Real MuJoCo mesh contact is a second safety layer.
+            res.append(
+                self.args.contact_weight
+                * self._actual_collision_depth()
+            )
+
+            # V3.0.3 temporal continuity inside IK, not output clipping.
+            if self.prev_solution is not None:
+                delta_q = z - self.prev_solution
+                res.extend(
+                    (
+                        self.args.temporal_weight
+                        * self.temporal_scale
+                        * delta_q
+                    ).tolist()
+                )
+            else:
+                res.extend(
+                    np.zeros_like(z).tolist()
+                )
+
+            # V3.3 velocity/acceleration continuity.
+            # A position-only temporal term can still jump between redundant
+            # IK branches. Penalizing a sudden CHANGE in joint velocity keeps
+            # motion on the same smooth branch without simply freezing motion.
+            if (
+                self.prev_solution is not None
+                and self.prev_delta is not None
+            ):
+                delta_q = z - self.prev_solution
+                predicted_delta = (
+                    self.args.velocity_damping
+                    * self.prev_delta
+                )
+                accel_like = (
+                    delta_q
+                    - predicted_delta
+                )
+                res.extend(
+                    (
+                        self.args.acceleration_weight
+                        * self.temporal_scale
+                        * accel_like
+                    ).tolist()
+                )
+            else:
+                res.extend(
+                    np.zeros_like(z).tolist()
+                )
+
+            # Soft joint-limit margin. Physical limits remain the hard bounds.
+            lower_distance = z - self.lower
+            upper_distance = self.upper - z
+            nearest_limit_distance = np.minimum(
+                lower_distance,
+                upper_distance,
+            )
+            limit_shortage = np.maximum(
+                0.0,
+                self.limit_margin - nearest_limit_distance,
+            )
+            normalized_limit_shortage = (
+                limit_shortage
+                / np.maximum(self.limit_margin, 1e-6)
+            )
+            res.extend(
+                (
+                    self.args.joint_limit_weight
+                    * normalized_limit_shortage
+                ).tolist()
+            )
+
+            # Tiny all-joint preference only. Old GMR arms are not preserved.
+            res.extend(
+                (
+                    self.args.original_weight
+                    * (
+                        z
+                        - original_arm
+                    )
+                ).tolist()
+            )
+
+            # V3.3.4 selective natural-posture prior.
+            # J03/J05 are the main redundant twist-like DoFs.  The reference
+            # is temporally filtered, so this guides branch selection rather
+            # than forcing the robot to reproduce potentially jittery GMR arms.
+            res.extend(
+                (
+                    self.args.twist_posture_weight
+                    * self.twist_posture_scale
+                    * (
+                        z
+                        - posture_anchor
+                    )
+                ).tolist()
+            )
+
+            return np.asarray(
+                res,
+                dtype=np.float64,
+            )
+
+        def run_ik(
+            hand_scale: float,
+            palm_scale: float,
+            start: np.ndarray,
+        ):
+            nonlocal active_hand_scale, active_palm_scale
+
+            active_hand_scale = float(hand_scale)
+            active_palm_scale = float(palm_scale)
+
+            start = np.clip(
+                np.asarray(start, dtype=np.float64),
+                solve_lower + 1e-8,
+                solve_upper - 1e-8,
+            )
+
+            return least_squares(
+                residual,
+                x0=start,
+                bounds=(
+                    solve_lower,
+                    solve_upper,
+                ),
+                method="trf",
+                max_nfev=self.args.max_nfev,
+                ftol=self.args.ftol,
+                xtol=self.args.xtol,
+                gtol=self.args.gtol,
+                verbose=0,
+            )
+
+        def continuity_stats(
+            candidate: np.ndarray,
+        ) -> tuple[float, float, float]:
+            if self.prev_solution is None:
+                return 0.0, 0.0, 0.0
+
+            delta = (
+                candidate
+                - self.prev_solution
+            )
+
+            max_step_all = float(
+                np.max(
+                    np.abs(delta)
+                )
+            )
+
+            max_step_prox = float(
+                np.max(
+                    np.abs(
+                        delta[
+                            self.proximal_mask
+                        ]
+                    )
+                )
+            )
+
+            if self.prev_delta is None:
+                max_accel = 0.0
+            else:
+                max_accel = float(
+                    np.max(
+                        np.abs(
+                            delta
+                            - (
+                                self.args.velocity_damping
+                                * self.prev_delta
+                            )
+                        )
+                    )
+                )
+
+            return (
+                max_step_all,
+                max_step_prox,
+                max_accel,
+            )
+
+        # Tier 0: normal V6 + Palm Roll soft orientation.
+        result = run_ik(
+            1.0,
+            1.0,
+            x0,
+        )
+        z = np.asarray(
+            result.x,
+            dtype=np.float64,
+        )
+        orientation_tier = 0
+
+        (
+            candidate_step,
+            candidate_prox_step,
+            candidate_accel,
+        ) = continuity_stats(z)
+
+        needs_relax = (
+            self.prev_solution is not None
+            and (
+                candidate_prox_step
+                > self.args.soft_proximal_trigger
+                or candidate_accel
+                > self.args.soft_accel_trigger
+            )
+        )
+
+        if needs_relax:
+            # Tier 1: Palm Roll yields first. Finger direction remains useful.
+            relaxed = run_ik(
+                self.args.relaxed_hand_scale,
+                self.args.relaxed_palm_scale,
+                self.prev_solution,
+            )
+            relaxed_z = np.asarray(
+                relaxed.x,
+                dtype=np.float64,
+            )
+            (
+                relaxed_step,
+                relaxed_prox_step,
+                relaxed_accel,
+            ) = continuity_stats(
+                relaxed_z
+            )
+
+            result = relaxed
+            z = relaxed_z
+            orientation_tier = 1
+
+            still_stressed = (
+                relaxed_prox_step
+                > self.args.soft_proximal_trigger
+                or relaxed_accel
+                > self.args.soft_accel_trigger
+            )
+
+            if still_stressed:
+                # Tier 2: discard Palm Roll for this frame and soften V6.
+                # Wrist/elbow spatial tracking, collision safety, temporal
+                # continuity and hard trust-region bounds remain active.
+                emergency = run_ik(
+                    self.args.emergency_hand_scale,
+                    self.args.emergency_palm_scale,
+                    self.prev_solution,
+                )
+                result = emergency
+                z = np.asarray(
+                    emergency.x,
+                    dtype=np.float64,
+                )
+                orientation_tier = 2
+
+        q_out = self._set_arm_vector(
+            body_q,
+            z,
+        )
+        self.set_q(q_out)
+
+        ep = self.endpoints()
+        center, basis, half, _ = torso
+
+        wrist_err_l = float(
+            np.linalg.norm(
+                ep["left"]["wrist"]
+                - targets["left"]["wrist"]
+            )
+        )
+        wrist_err_r = float(
+            np.linalg.norm(
+                ep["right"]["wrist"]
+                - targets["right"]["wrist"]
+            )
+        )
+        elbow_err_l = float(
+            np.linalg.norm(
+                ep["left"]["elbow"]
+                - targets["left"]["elbow"]
+            )
+        )
+        elbow_err_r = float(
+            np.linalg.norm(
+                ep["right"]["elbow"]
+                - targets["right"]["elbow"]
+            )
+        )
+
+        hand_dist = float(
+            np.linalg.norm(
+                ep["left"]["wrist"]
+                - ep["right"]["wrist"]
+            )
+        )
+
+        fore_dist = segment_distance(
+            ep["left"]["elbow"],
+            ep["left"]["wrist"],
+            ep["right"]["elbow"],
+            ep["right"]["wrist"],
+        )
+
+        torso_clearances = []
+        for side in ("left", "right"):
+            e = ep[side]["elbow"]
+            w = ep[side]["wrist"]
+
+            for p in (
+                e,
+                e + (w - e) / 3.0,
+                e + 2.0 * (w - e) / 3.0,
+                w,
+            ):
+                torso_clearances.append(
+                    signed_distance_to_obb(
+                        p,
+                        center,
+                        basis,
+                        half,
+                    )
+                )
+
+        hand_dir_err = {}
+        palm_dir_err = {}
+
+        for side in ("left", "right"):
+            hand_rot = body_rot(
+                self.data,
+                self.body_ids[side]["wrist"],
+            )
+
+            finger_world = unit(
+                hand_rot @ FINGER_LOCAL[side]
+            )
+            palm_world = unit(
+                hand_rot @ PALM_LOCAL[side]
+            )
+
+            hand_dir_err[side] = angle_deg(
+                finger_world,
+                targets[side]["finger_dir"],
+            )
+
+            palm_dir_err[side] = angle_deg(
+                palm_world,
+                targets[side]["palm_dir"],
+            )
+
+        if self.prev_output_arm is None:
+            delta_now = np.zeros_like(z)
+            max_step = 0.0
+            max_prox_step = 0.0
+            max_distal_step = 0.0
+            max_accel = 0.0
+        else:
+            delta_now = (
+                z
+                - self.prev_output_arm
+            )
+            max_step = float(
+                np.max(
+                    np.abs(
+                        delta_now
+                    )
+                )
+            )
+            max_prox_step = float(
+                np.max(
+                    np.abs(
+                        delta_now[
+                            self.proximal_mask
+                        ]
+                    )
+                )
+            )
+            max_distal_step = float(
+                np.max(
+                    np.abs(
+                        delta_now[
+                            ~self.proximal_mask
+                        ]
+                    )
+                )
+            )
+
+            if self.prev_delta is None:
+                max_accel = 0.0
+            else:
+                max_accel = float(
+                    np.max(
+                        np.abs(
+                            delta_now
+                            - (
+                                self.args.velocity_damping
+                                * self.prev_delta
+                            )
+                        )
+                    )
+                )
+
+        self.prev_delta = delta_now.copy()
+        self.prev_solution = z.copy()
+        self.prev_output_arm = z.copy()
+        self.posture_anchor = posture_anchor.copy()
+
+        left_twist_dev = float(
+            np.mean(
+                np.abs(
+                    z[self.twist_diag_mask_left]
+                    - posture_anchor[self.twist_diag_mask_left]
+                )
+            )
+        )
+        right_twist_dev = float(
+            np.mean(
+                np.abs(
+                    z[self.twist_diag_mask_right]
+                    - posture_anchor[self.twist_diag_mask_right]
+                )
+            )
+        )
+
+        diag = {
+            "cost": float(result.cost),
+            "nfev": float(result.nfev),
+            "optimality": float(result.optimality),
+            "success": float(bool(result.success)),
+            "wrist_err_l": wrist_err_l,
+            "wrist_err_r": wrist_err_r,
+            "elbow_err_l": elbow_err_l,
+            "elbow_err_r": elbow_err_r,
+            "hand_hand_dist": hand_dist,
+            "forearm_forearm_dist": fore_dist,
+            "min_torso_clearance": float(
+                min(torso_clearances)
+            ),
+            "contact_count": float(
+                self._collision_contact_count()
+            ),
+            "contact_depth": float(
+                self._actual_collision_depth()
+            ),
+            "max_joint_step": max_step,
+            "max_proximal_step": max_prox_step,
+            "max_distal_step": max_distal_step,
+            "max_joint_accel": max_accel,
+            "orientation_tier": float(orientation_tier),
+            "left_human_elbow_bend_deg":
+                float(targets["left"]["human_elbow_bend_deg"]),
+            "right_human_elbow_bend_deg":
+                float(targets["right"]["human_elbow_bend_deg"]),
+            "left_robot_elbow_flex_rad":
+                float(z[self.elbow_z_index["left"]]),
+            "right_robot_elbow_flex_rad":
+                float(z[self.elbow_z_index["right"]]),
+            "left_extension_gate":
+                float(targets["left"]["extension_gate"]),
+            "right_extension_gate":
+                float(targets["right"]["extension_gate"]),
+            "left_twist_posture_dev_rad": left_twist_dev,
+            "right_twist_posture_dev_rad": right_twist_dev,
+            "hand_scale_used": float(active_hand_scale),
+            "palm_scale_used": float(active_palm_scale),
+            "hand_dir_err_l_deg": float(hand_dir_err["left"]),
+            "hand_dir_err_r_deg": float(hand_dir_err["right"]),
+            "palm_dir_err_l_deg": float(palm_dir_err["left"]),
+            "palm_dir_err_r_deg": float(palm_dir_err["right"]),
+            "palm_roll_target_l_deg": float(targets["left"]["palm_roll_deg"]),
+            "palm_roll_target_r_deg": float(targets["right"]["palm_roll_deg"]),
+        }
+
+        return q_out, diag
+
+
+def load_human_joint_positions(
+    smplx_path: Path,
+) -> tuple[dict[str, np.ndarray], int]:
+    """
+    V3-local SMPL-X loader.
+
+    Important:
+    - Do NOT modify the stable V2 SMPL/GMR loader.
+    - Explicitly expand betas/expression to every frame.
+    - Preserve the checkpoint's y-up -> z-up transform.
+    """
+    smplx_data = np.load(
+        smplx_path,
+        allow_pickle=True,
+    )
+
+    num_frames = int(
+        smplx_data["pose_body"].shape[0]
+    )
+
+    gender_raw = np.asarray(
+        smplx_data["gender"]
+    )
+    if gender_raw.shape == ():
+        gender = str(gender_raw.item())
+    else:
+        gender = str(
+            gender_raw.reshape(-1)[0]
+        )
+
+    print(
+        "[V3 SMPL-X] frames:",
+        num_frames,
+    )
+    print(
+        "[V3 SMPL-X] gender:",
+        gender,
+    )
+
+    body_model = smplx.create(
+        str(SMPLX_FOLDER),
+        "smplx",
+        gender=gender,
+        use_pca=False,
+        batch_size=num_frames,
+    )
+
+    root_orient = np.asarray(
+        smplx_data["root_orient"],
+        dtype=np.float32,
+    ).reshape(
+        num_frames,
+        3,
+    )
+
+    trans = np.asarray(
+        smplx_data["trans"],
+        dtype=np.float32,
+    ).reshape(
+        num_frames,
+        3,
+    )
+
+    rotation_matrix = np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, -1.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    rot_fix = R.from_matrix(
+        rotation_matrix
+    )
+
+    root_orient = (
+        rot_fix
+        * R.from_rotvec(root_orient)
+    ).as_rotvec().astype(
+        np.float32
+    )
+
+    trans = (
+        trans
+        @ rotation_matrix.T
+    ).astype(
+        np.float32
+    )
+
+    print(
+        "[V3 SMPL-X] Applied coordinate fix: "
+        "y-up -> z-up"
+    )
+
+    raw_betas = np.asarray(
+        smplx_data["betas"],
+        dtype=np.float32,
+    ).reshape(-1)
+
+    target_beta_dim = int(
+        getattr(
+            body_model,
+            "num_betas",
+            raw_betas.shape[0],
+        )
+    )
+
+    if raw_betas.shape[0] < target_beta_dim:
+        raw_betas = np.pad(
+            raw_betas,
+            (
+                0,
+                target_beta_dim
+                - raw_betas.shape[0],
+            ),
+        )
+    elif raw_betas.shape[0] > target_beta_dim:
+        raw_betas = raw_betas[
+            :target_beta_dim
+        ]
+
+    betas = np.repeat(
+        raw_betas[None, :],
+        num_frames,
+        axis=0,
+    )
+
+    if hasattr(
+        body_model,
+        "num_expression_coeffs",
+    ):
+        expression_dim = int(
+            body_model.num_expression_coeffs
+        )
+    elif hasattr(
+        body_model,
+        "expression",
+    ):
+        expression_dim = int(
+            body_model.expression.shape[-1]
+        )
+    else:
+        expression_dim = 10
+
+    print(
+        "[V3 SMPL-X] betas:",
+        betas.shape,
+    )
+    print(
+        "[V3 SMPL-X] expression:",
+        (
+            num_frames,
+            expression_dim,
+        ),
+    )
+
+    with torch.no_grad():
+        smplx_output = body_model(
+            betas=torch.tensor(
+                betas,
+                dtype=torch.float32,
+            ),
+            expression=torch.zeros(
+                (
+                    num_frames,
+                    expression_dim,
+                ),
+                dtype=torch.float32,
+            ),
+            global_orient=torch.tensor(
+                root_orient,
+                dtype=torch.float32,
+            ),
+            body_pose=torch.tensor(
+                np.asarray(
+                    smplx_data["pose_body"],
+                    dtype=np.float32,
+                ),
+                dtype=torch.float32,
+            ),
+            transl=torch.tensor(
+                trans,
+                dtype=torch.float32,
+            ),
+            left_hand_pose=torch.zeros(
+                num_frames,
+                45,
+                dtype=torch.float32,
+            ),
+            right_hand_pose=torch.zeros(
+                num_frames,
+                45,
+                dtype=torch.float32,
+            ),
+            jaw_pose=torch.zeros(
+                num_frames,
+                3,
+                dtype=torch.float32,
+            ),
+            leye_pose=torch.zeros(
+                num_frames,
+                3,
+                dtype=torch.float32,
+            ),
+            reye_pose=torch.zeros(
+                num_frames,
+                3,
+                dtype=torch.float32,
+            ),
+            return_full_pose=True,
+        )
+
+    joints = (
+        smplx_output.joints
+        .detach()
+        .cpu()
+        .numpy()
+    )
+
+    names = JOINT_NAMES[
+        : joints.shape[1]
+    ]
+
+    name_to_idx = {
+        name: i
+        for i, name in enumerate(names)
+    }
+
+    missing = [
+        name
+        for name in HUMAN_JOINTS
+        if name not in name_to_idx
+    ]
+
+    if missing:
+        raise RuntimeError(
+            f"SMPL-X joints missing: {missing}"
+        )
+
+    out = {
+        name: np.asarray(
+            joints[
+                :,
+                name_to_idx[name],
+                :,
+            ],
+            dtype=np.float64,
+        )
+        for name in HUMAN_JOINTS
+    }
+
+    print(
+        "[V3 SMPL-X] joints loaded:",
+        ", ".join(HUMAN_JOINTS),
+    )
+
+    return out, int(
+        joints.shape[0]
+    )
+
+
+def load_hand_relative_csv(
+    path: Path,
+) -> tuple[dict[str, np.ndarray], int]:
+    with path.open("r", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+
+    if not rows:
+        raise RuntimeError(f"empty V6 hand-direction CSV: {path}")
+
+    max_frame = max(int(r["frame"]) for r in rows)
+    n = max_frame + 1
+    out = {
+        "left": np.full(n, np.nan, dtype=np.float64),
+        "right": np.full(n, np.nan, dtype=np.float64),
+    }
+
+    for r in rows:
+        i = int(r["frame"])
+        out["left"][i] = float(r["left_relative_forearm_deg"])
+        out["right"][i] = float(r["right_relative_forearm_deg"])
+
+    for side in ("left", "right"):
+        if not np.isfinite(out[side]).all():
+            bad = np.where(~np.isfinite(out[side]))[0]
+            raise RuntimeError(
+                f"non-finite V6 {side} relative angle at frames {bad[:20].tolist()}"
+            )
+
+    return out, n
+
+
+def load_palm_roll_csv(
+    path: Path,
+) -> tuple[dict[str, np.ndarray], int]:
+    with path.open("r", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+
+    if not rows:
+        raise RuntimeError(
+            f"empty Palm Roll V2 CSV: {path}"
+        )
+
+    max_frame = max(
+        int(r["frame"])
+        for r in rows
+    )
+
+    n = max_frame + 1
+
+    out = {
+        "left": np.full(
+            n,
+            np.nan,
+            dtype=np.float64,
+        ),
+        "right": np.full(
+            n,
+            np.nan,
+            dtype=np.float64,
+        ),
+    }
+
+    for r in rows:
+        i = int(r["frame"])
+
+        out["left"][i] = float(
+            r["left_palm_roll_v2_deg"]
+        )
+
+        out["right"][i] = float(
+            r["right_palm_roll_v2_deg"]
+        )
+
+    for side in ("left", "right"):
+        if not np.isfinite(
+            out[side]
+        ).all():
+            bad = np.where(
+                ~np.isfinite(
+                    out[side]
+                )
+            )[0]
+
+            raise RuntimeError(
+                f"non-finite Palm Roll V2 {side} "
+                f"at frames {bad[:20].tolist()}"
+            )
+
+    return out, n
+
+
+def palm_roll_frame(
+    seq: dict[str, np.ndarray],
+    i: int,
+) -> dict[str, float]:
+    return {
+        "left": float(
+            seq["left"][i]
+        ),
+        "right": float(
+            seq["right"][i]
+        ),
+    }
+
+
+def hand_relative_frame(
+    seq: dict[str, np.ndarray],
+    i: int,
+) -> dict[str, float]:
+    return {
+        "left": float(seq["left"][i]),
+        "right": float(seq["right"][i]),
+    }
+
+
+def human_frame(
+    human_seq: dict[str, np.ndarray],
+    i: int,
+) -> dict[str, np.ndarray]:
+    return {
+        name: values[i].copy()
+        for name, values in human_seq.items()
+    }
+
+
+def render_motion(
+    qpos_seq: np.ndarray,
+    indices: list[int],
+    fps: float,
+    video_path: Path,
+) -> None:
+    video_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    viewer = RobotMotionViewer(
+        robot_type="openloong",
+        motion_fps=fps,
+        transparent_robot=0,
+        record_video=True,
+        video_path=str(video_path),
+        camera_follow=True,
+    )
+
+    try:
+        for i in indices:
+            q = qpos_seq[i]
+            viewer.step(
+                q[:3],
+                q[3:7],
+                q[7:],
+                rate_limit=False,
+                follow_camera=True,
+            )
+    finally:
+        viewer.close()
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description=(
+            "OpenLoong V3.3 continuity-first bilateral 14-DoF retargeting. "
+            "Arm continuity is a hard priority; Palm Roll is soft and may be "
+            "relaxed when orientation conflicts with a continuous IK branch."
+        )
+    )
+
+    p.add_argument(
+        "--body-csv",
+        type=Path,
+        default=DEFAULT_BODY_CSV,
+    )
+    p.add_argument(
+        "--smplx",
+        type=Path,
+        default=DEFAULT_SMPLX,
+    )
+    p.add_argument(
+        "--hand-dir-csv",
+        type=Path,
+        default=DEFAULT_HAND_DIR_CSV,
+    )
+    p.add_argument(
+        "--palm-roll-csv",
+        type=Path,
+        default=DEFAULT_PALM_ROLL_CSV,
+    )
+    p.add_argument(
+        "--out-dir",
+        type=Path,
+        default=DEFAULT_OUT_DIR,
+    )
+    p.add_argument(
+        "--fps",
+        type=float,
+        default=30.0,
+    )
+    p.add_argument(
+        "--start-frame",
+        type=int,
+        default=0,
+    )
+    p.add_argument(
+        "--max-frames",
+        type=int,
+        default=0,
+        help="0 = process to the end",
+    )
+    p.add_argument(
+        "--render",
+        action="store_true",
+    )
+
+    p.add_argument(
+        "--upper-length-scale",
+        type=float,
+        default=1.0,
+    )
+    p.add_argument(
+        "--forearm-length-scale",
+        type=float,
+        default=1.0,
+    )
+
+    p.add_argument(
+        "--torso-half-x",
+        type=float,
+        default=0.14,
+    )
+    p.add_argument(
+        "--torso-half-y-scale",
+        type=float,
+        default=0.82,
+    )
+    p.add_argument(
+        "--torso-z-padding",
+        type=float,
+        default=0.03,
+    )
+
+    p.add_argument(
+        "--hand-torso-margin",
+        type=float,
+        default=0.075,
+    )
+    p.add_argument(
+        "--elbow-torso-margin",
+        type=float,
+        default=0.050,
+    )
+    p.add_argument(
+        "--forearm-torso-margin",
+        type=float,
+        default=0.055,
+    )
+    p.add_argument(
+        "--hand-hand-min",
+        type=float,
+        default=0.14,
+    )
+    p.add_argument(
+        "--forearm-forearm-min",
+        type=float,
+        default=0.075,
+    )
+
+    p.add_argument(
+        "--elbow-weight",
+        type=float,
+        default=10.0,
+    )
+    p.add_argument(
+        "--wrist-weight",
+        type=float,
+        default=18.0,
+    )
+    p.add_argument(
+        "--torso-collision-weight",
+        type=float,
+        default=45.0,
+    )
+    p.add_argument(
+        "--hand-hand-weight",
+        type=float,
+        default=55.0,
+    )
+    p.add_argument(
+        "--forearm-forearm-weight",
+        type=float,
+        default=42.0,
+    )
+    p.add_argument(
+        "--contact-weight",
+        type=float,
+        default=120.0,
+    )
+    p.add_argument(
+        "--temporal-weight",
+        type=float,
+        default=1.15,
+        help=(
+            "V3.3 previous-pose continuity weight. Hard trust-region bounds "
+            "provide the non-negotiable jump protection."
+        ),
+    )
+    p.add_argument(
+        "--acceleration-weight",
+        type=float,
+        default=1.25,
+        help=(
+            "Penalize sudden changes of joint velocity. This targets visual "
+            "jumps without simply freezing the arm at the previous pose."
+        ),
+    )
+    p.add_argument(
+        "--velocity-damping",
+        type=float,
+        default=0.70,
+        help=(
+            "Prediction factor for previous joint delta used by the V3.3 "
+            "acceleration continuity term."
+        ),
+    )
+    p.add_argument(
+        "--hard-step-proximal",
+        type=float,
+        default=0.09,
+        help=(
+            "Hard per-frame IK trust-region radius [rad] for arm joints 01-04. "
+            "This is enforced inside least_squares, not by post-hoc clipping."
+        ),
+    )
+    p.add_argument(
+        "--hard-step-distal",
+        type=float,
+        default=0.10,
+        help=(
+            "Hard per-frame IK trust-region radius [rad] for arm joints 05-07."
+        ),
+    )
+    p.add_argument(
+        "--soft-proximal-trigger",
+        type=float,
+        default=0.065,
+        help=(
+            "If the normal orientation solve needs more proximal motion than "
+            "this, relax Palm/V6 orientation before accepting the frame."
+        ),
+    )
+    p.add_argument(
+        "--soft-accel-trigger",
+        type=float,
+        default=0.065,
+        help=(
+            "Trigger orientation relaxation when joint velocity changes too "
+            "abruptly even if the hard step bound is not reached."
+        ),
+    )
+    p.add_argument(
+        "--relaxed-hand-scale",
+        type=float,
+        default=0.70,
+    )
+    p.add_argument(
+        "--relaxed-palm-scale",
+        type=float,
+        default=0.15,
+    )
+    p.add_argument(
+        "--emergency-hand-scale",
+        type=float,
+        default=0.35,
+    )
+    p.add_argument(
+        "--emergency-palm-scale",
+        type=float,
+        default=0.0,
+    )
+    p.add_argument(
+        "--elbow-extension-weight",
+        type=float,
+        default=1.60,
+        help=(
+            "Soft J04 extension guidance, active only when the HUMAN arm "
+            "is close to straight."
+        ),
+    )
+    p.add_argument(
+        "--elbow-extension-start-deg",
+        type=float,
+        default=50.0,
+    )
+    p.add_argument(
+        "--elbow-extension-full-deg",
+        type=float,
+        default=18.0,
+    )
+    p.add_argument(
+        "--elbow-flex-scale",
+        type=float,
+        default=1.0,
+    )
+    p.add_argument(
+        "--elbow-extension-target-max-rad",
+        type=float,
+        default=0.90,
+    )
+    p.add_argument(
+        "--extension-hand-relax",
+        type=float,
+        default=0.30,
+        help=(
+            "Reduce V6 priority as the HUMAN arm approaches full extension."
+        ),
+    )
+    p.add_argument(
+        "--extension-palm-relax",
+        type=float,
+        default=0.80,
+        help=(
+            "Strongly reduce Palm priority when HUMAN arm extension conflicts "
+            "with hand orientation."
+        ),
+    )
+
+    p.add_argument(
+        "--joint-limit-weight",
+        type=float,
+        default=0.55,
+        help=(
+            "V3.0.3 soft joint-limit cost. "
+            "This does not clip joint positions."
+        ),
+    )
+    p.add_argument(
+        "--original-weight",
+        type=float,
+        default=0.02,
+    )
+    p.add_argument(
+        "--twist-posture-weight",
+        type=float,
+        default=0.30,
+        help=(
+            "V3.3.4 selective natural-posture weight, concentrated on "
+            "redundant J03/J05 twist-like joints."
+        ),
+    )
+    p.add_argument(
+        "--twist-posture-alpha",
+        type=float,
+        default=0.18,
+        help=(
+            "Low-pass update factor for the natural-posture reference. "
+            "Smaller values make the branch preference change more slowly."
+        ),
+    )
+
+    p.add_argument(
+        "--hand-dir-weight",
+        type=float,
+        default=0.60,
+        help=(
+            "V3.3 V6 hand long-axis soft weight. It may be reduced on "
+            "continuity-stressed frames."
+        ),
+    )
+    p.add_argument(
+        "--palm-dir-weight",
+        type=float,
+        default=0.15,
+        help=(
+            "V3.3 Palm Roll V2 soft weight. Palm orientation explicitly yields "
+            "before visible arm continuity."
+        ),
+    )
+    p.add_argument(
+        "--palm-roll-sign-left",
+        type=float,
+        default=1.0,
+        help=(
+            "Sign for LEFT Palm Roll V2 around the target finger axis. "
+            "Flip only if visual inspection proves LEFT roll is mirrored."
+        ),
+    )
+    p.add_argument(
+        "--palm-roll-sign-right",
+        type=float,
+        default=1.0,
+        help=(
+            "Sign for RIGHT Palm Roll V2 around the target finger axis. "
+            "Flip only if visual inspection proves RIGHT roll is mirrored."
+        ),
+    )
+    p.add_argument(
+        "--hand-dir-sign",
+        type=float,
+        default=1.0,
+        help=(
+            "Sign used when lifting V6's image-plane relative angle. "
+            "Use -1 only if visual inspection proves the direction is mirrored."
+        ),
+    )
+
+    p.add_argument(
+        "--max-nfev",
+        type=int,
+        default=40,
+    )
+    p.add_argument(
+        "--ftol",
+        type=float,
+        default=2e-5,
+    )
+    p.add_argument(
+        "--xtol",
+        type=float,
+        default=2e-5,
+    )
+    p.add_argument(
+        "--gtol",
+        type=float,
+        default=2e-5,
+    )
+    p.add_argument(
+        "--joint-step-warn",
+        type=float,
+        default=0.10,
+        help=(
+            "Diagnostic warning threshold. V3.3 also has separate hard IK "
+            "trust-region bounds; no post-hoc clipping is applied."
+        ),
+    )
+
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    args.body_csv = (
+        args.body_csv
+        .expanduser()
+        .resolve()
+    )
+    args.smplx = (
+        args.smplx
+        .expanduser()
+        .resolve()
+    )
+    args.hand_dir_csv = (
+        args.hand_dir_csv
+        .expanduser()
+        .resolve()
+    )
+    args.palm_roll_csv = (
+        args.palm_roll_csv
+        .expanduser()
+        .resolve()
+    )
+    args.out_dir = (
+        args.out_dir
+        .expanduser()
+        .resolve()
+    )
+
+    if not args.body_csv.exists():
+        raise FileNotFoundError(
+            f"body CSV not found: {args.body_csv}"
+        )
+    if not args.smplx.exists():
+        raise FileNotFoundError(
+            f"SMPL-X npz not found: {args.smplx}"
+        )
+    if not args.hand_dir_csv.exists():
+        raise FileNotFoundError(
+            f"V6 hand-direction CSV not found: {args.hand_dir_csv}"
+        )
+    if not args.palm_roll_csv.exists():
+        raise FileNotFoundError(
+            f"Palm Roll V2 CSV not found: {args.palm_roll_csv}"
+        )
+
+    args.out_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    out_csv = (
+        args.out_dir
+        / "csv/openloong/live_motion.csv"
+    )
+    diag_csv = (
+        args.out_dir
+        / "diagnostics/arm_spatial_diagnostics.csv"
+    )
+    video_path = (
+        args.out_dir
+        / "video/openloong_armspatial_v1.mp4"
+    )
+
+    out_csv.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    diag_csv.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    video_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    body_csv = np.loadtxt(
+        args.body_csv,
+        delimiter=",",
+        dtype=np.float64,
+    )
+
+    if body_csv.ndim == 1:
+        body_csv = body_csv[None, :]
+
+    model = mj.MjModel.from_xml_path(
+        str(
+            ROBOT_XML_DICT[
+                "openloong"
+            ]
+        )
+    )
+
+    if body_csv.shape[1] != int(model.nq):
+        raise RuntimeError(
+            "CSV/model mismatch: "
+            f"csv_cols={body_csv.shape[1]} "
+            f"model_nq={model.nq}"
+        )
+
+    qpos_seq = np.stack(
+        [
+            csv_row_to_qpos(row)
+            for row in body_csv
+        ],
+        axis=0,
+    )
+
+    human_seq, human_frames = (
+        load_human_joint_positions(
+            args.smplx
+        )
+    )
+
+    hand_seq, hand_frames = load_hand_relative_csv(
+        args.hand_dir_csv
+    )
+
+    palm_seq, palm_frames = load_palm_roll_csv(
+        args.palm_roll_csv
+    )
+
+    if abs(
+        len(qpos_seq)
+        - human_frames
+    ) > 2:
+        raise RuntimeError(
+            "Frame mismatch is too large: "
+            f"body={len(qpos_seq)} "
+            f"smplx={human_frames}"
+        )
+
+    if abs(len(qpos_seq) - hand_frames) > 2:
+        raise RuntimeError(
+            "V6/body frame mismatch is too large: "
+            f"body={len(qpos_seq)} hand_v6={hand_frames}"
+        )
+
+    if abs(len(qpos_seq) - palm_frames) > 2:
+        raise RuntimeError(
+            "Palm Roll V2/body frame mismatch is too large: "
+            f"body={len(qpos_seq)} palm_v2={palm_frames}"
+        )
+
+    n = min(
+        len(qpos_seq),
+        human_frames,
+        hand_frames,
+        palm_frames,
+    )
+
+    start = max(
+        0,
+        int(args.start_frame),
+    )
+
+    if start >= n:
+        raise ValueError(
+            f"start-frame {start} "
+            f">= available frames {n}"
+        )
+
+    if int(args.max_frames) > 0:
+        end = min(
+            n,
+            start
+            + int(args.max_frames),
+        )
+    else:
+        end = n
+
+    indices = list(
+        range(
+            start,
+            end,
+        )
+    )
+
+    out_qpos = qpos_seq.copy()
+    solver = (
+        OpenLoongArmSpatialRetargeter(
+            model,
+            args,
+        )
+    )
+
+    print("=" * 80)
+    print(
+        "OpenLoong V3.3 "
+        "Continuity-First Arm + Hand Pose Retargeting"
+    )
+    print("=" * 80)
+    print(
+        "body CSV :",
+        args.body_csv,
+    )
+    print(
+        "SMPL-X   :",
+        args.smplx,
+    )
+    print(
+        "V6 hand  :",
+        args.hand_dir_csv,
+    )
+    print(
+        "Palm V2  :",
+        args.palm_roll_csv,
+    )
+    print(
+        "hand dir :",
+        f"weight={args.hand_dir_weight:.3f} sign={args.hand_dir_sign:+.1f}",
+    )
+    print(
+        "palm dir :",
+        (
+            f"weight={args.palm_dir_weight:.3f} "
+            f"signL={args.palm_roll_sign_left:+.1f} "
+            f"signR={args.palm_roll_sign_right:+.1f}"
+        ),
+    )
+    print(
+        "continuity:",
+        (
+            f"temporal={args.temporal_weight:.3f} "
+            f"accel={args.acceleration_weight:.3f} "
+            f"hard_step(prox/dist)="
+            f"{args.hard_step_proximal:.3f}/{args.hard_step_distal:.3f} rad"
+        ),
+    )
+    print(
+        "orientation relax:",
+        (
+            f"tier1 hand/palm={args.relaxed_hand_scale:.2f}/"
+            f"{args.relaxed_palm_scale:.2f} "
+            f"tier2={args.emergency_hand_scale:.2f}/"
+            f"{args.emergency_palm_scale:.2f}"
+        ),
+    )
+    print(
+        "frames   :",
+        f"{start}..{end - 1} "
+        f"({len(indices)} frames)",
+    )
+    print(
+        "model nq :",
+        model.nq,
+    )
+    print(
+        "left arm qpos :",
+        solver.arm_qpos["left"],
+    )
+    print(
+        "right arm qpos:",
+        solver.arm_qpos["right"],
+    )
+    print(
+        "robot arm lengths [m]:",
+        (
+            "L "
+            f"upper={solver.upper_len['left']:.4f} "
+            f"fore={solver.forearm_len['left']:.4f}"
+        ),
+        (
+            "R "
+            f"upper={solver.upper_len['right']:.4f} "
+            f"fore={solver.forearm_len['right']:.4f}"
+        ),
+    )
+    print("=" * 80)
+
+    fieldnames = [
+        "frame",
+        "time_sec",
+        "cost",
+        "nfev",
+        "optimality",
+        "success",
+        "left_wrist_err_mm",
+        "right_wrist_err_mm",
+        "left_elbow_err_mm",
+        "right_elbow_err_mm",
+        "left_hand_dir_err_deg",
+        "right_hand_dir_err_deg",
+        "left_palm_dir_err_deg",
+        "right_palm_dir_err_deg",
+        "left_palm_roll_target_deg",
+        "right_palm_roll_target_deg",
+        "hand_hand_dist_m",
+        "forearm_forearm_dist_m",
+        "min_torso_clearance_m",
+        "contact_count",
+        "contact_depth_m",
+        "max_joint_step_rad",
+        "max_proximal_step_rad",
+        "max_distal_step_rad",
+        "max_joint_accel_rad",
+        "orientation_tier",
+        "left_human_elbow_bend_deg",
+        "right_human_elbow_bend_deg",
+        "left_robot_elbow_flex_rad",
+        "right_robot_elbow_flex_rad",
+        "left_extension_gate",
+        "right_extension_gate",
+        "left_twist_posture_dev_rad",
+        "right_twist_posture_dev_rad",
+        "hand_scale_used",
+        "palm_scale_used",
+        "step_warning",
+    ]
+
+    diagnostics: list[
+        dict[str, float | int]
+    ] = []
+
+    for k, i in enumerate(indices):
+        body_q = qpos_seq[i]
+        h = human_frame(
+            human_seq,
+            i,
+        )
+
+        hand_rel = hand_relative_frame(
+            hand_seq,
+            i,
+        )
+
+        palm_roll = palm_roll_frame(
+            palm_seq,
+            i,
+        )
+
+        q_out, d = solver.solve(
+            body_q,
+            h,
+            hand_rel,
+            palm_roll,
+        )
+
+        out_qpos[i] = q_out
+
+        step_warning = int(
+            d["max_joint_step"]
+            > args.joint_step_warn
+        )
+
+        diagnostics.append(
+            {
+                "frame": i,
+                "time_sec": i / args.fps,
+                "cost": d["cost"],
+                "nfev": int(d["nfev"]),
+                "optimality": d["optimality"],
+                "success": int(d["success"]),
+                "left_wrist_err_mm":
+                    d["wrist_err_l"] * 1000.0,
+                "right_wrist_err_mm":
+                    d["wrist_err_r"] * 1000.0,
+                "left_elbow_err_mm":
+                    d["elbow_err_l"] * 1000.0,
+                "right_elbow_err_mm":
+                    d["elbow_err_r"] * 1000.0,
+                "left_hand_dir_err_deg":
+                    d["hand_dir_err_l_deg"],
+                "right_hand_dir_err_deg":
+                    d["hand_dir_err_r_deg"],
+                "left_palm_dir_err_deg":
+                    d["palm_dir_err_l_deg"],
+                "right_palm_dir_err_deg":
+                    d["palm_dir_err_r_deg"],
+                "left_palm_roll_target_deg":
+                    d["palm_roll_target_l_deg"],
+                "right_palm_roll_target_deg":
+                    d["palm_roll_target_r_deg"],
+                "hand_hand_dist_m":
+                    d["hand_hand_dist"],
+                "forearm_forearm_dist_m":
+                    d["forearm_forearm_dist"],
+                "min_torso_clearance_m":
+                    d["min_torso_clearance"],
+                "contact_count":
+                    int(d["contact_count"]),
+                "contact_depth_m":
+                    d["contact_depth"],
+                "max_joint_step_rad":
+                    d["max_joint_step"],
+                "max_proximal_step_rad":
+                    d["max_proximal_step"],
+                "max_distal_step_rad":
+                    d["max_distal_step"],
+                "max_joint_accel_rad":
+                    d["max_joint_accel"],
+                "orientation_tier":
+                    int(d["orientation_tier"]),
+                "left_human_elbow_bend_deg":
+                    d["left_human_elbow_bend_deg"],
+                "right_human_elbow_bend_deg":
+                    d["right_human_elbow_bend_deg"],
+                "left_robot_elbow_flex_rad":
+                    d["left_robot_elbow_flex_rad"],
+                "right_robot_elbow_flex_rad":
+                    d["right_robot_elbow_flex_rad"],
+                "left_extension_gate":
+                    d["left_extension_gate"],
+                "right_extension_gate":
+                    d["right_extension_gate"],
+                "left_twist_posture_dev_rad":
+                    d["left_twist_posture_dev_rad"],
+                "right_twist_posture_dev_rad":
+                    d["right_twist_posture_dev_rad"],
+                "hand_scale_used":
+                    d["hand_scale_used"],
+                "palm_scale_used":
+                    d["palm_scale_used"],
+                "step_warning":
+                    step_warning,
+            }
+        )
+
+        if (
+            k == 0
+            or (k + 1) % 15 == 0
+            or k + 1 == len(indices)
+            or step_warning
+            or d["contact_count"] > 0
+        ):
+            print(
+                f"[{k + 1:4d}/{len(indices):4d}] "
+                f"frame={i:3d} "
+                f"t={i/args.fps:5.2f}s "
+                "Werr=("
+                f"{d['wrist_err_l']*1000:5.1f},"
+                f"{d['wrist_err_r']*1000:5.1f}"
+                ")mm "
+                f"HH={d['hand_hand_dist']:.3f}m "
+                f"FF={d['forearm_forearm_dist']:.3f}m "
+                f"torso={d['min_torso_clearance']:.3f}m "
+                f"Dir=({d['hand_dir_err_l_deg']:4.1f},{d['hand_dir_err_r_deg']:4.1f})deg "
+                f"Palm=({d['palm_dir_err_l_deg']:4.1f},{d['palm_dir_err_r_deg']:4.1f})deg "
+                f"contact={int(d['contact_count'])} "
+                f"dq={d['max_joint_step']:.3f} "
+                f"prox={d['max_proximal_step']:.3f} "
+                f"acc={d['max_joint_accel']:.3f} "
+                f"tier={int(d['orientation_tier'])} "
+                f"bend=({d['left_human_elbow_bend_deg']:4.1f},"
+                f"{d['right_human_elbow_bend_deg']:4.1f})deg "
+                f"J04=({d['left_robot_elbow_flex_rad']:.2f},"
+                f"{d['right_robot_elbow_flex_rad']:.2f})"
+                + (
+                    "  <-- STEP WARN"
+                    if step_warning
+                    else ""
+                )
+            )
+
+    out_rows = np.stack(
+        [
+            qpos_to_csv_row(q)
+            for q in out_qpos
+        ],
+        axis=0,
+    )
+
+    np.savetxt(
+        out_csv,
+        out_rows,
+        delimiter=",",
+        fmt="%.9f",
+    )
+
+    with diag_csv.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=fieldnames,
+        )
+        writer.writeheader()
+        writer.writerows(
+            diagnostics
+        )
+
+    wr_l = np.array(
+        [
+            d["left_wrist_err_mm"]
+            for d in diagnostics
+        ],
+        dtype=float,
+    )
+    wr_r = np.array(
+        [
+            d["right_wrist_err_mm"]
+            for d in diagnostics
+        ],
+        dtype=float,
+    )
+    hh = np.array(
+        [
+            d["hand_hand_dist_m"]
+            for d in diagnostics
+        ],
+        dtype=float,
+    )
+    ff = np.array(
+        [
+            d["forearm_forearm_dist_m"]
+            for d in diagnostics
+        ],
+        dtype=float,
+    )
+    tc = np.array(
+        [
+            d["min_torso_clearance_m"]
+            for d in diagnostics
+        ],
+        dtype=float,
+    )
+    dq = np.array(
+        [
+            d["max_joint_step_rad"]
+            for d in diagnostics
+        ],
+        dtype=float,
+    )
+    dir_l = np.array(
+        [d["left_hand_dir_err_deg"] for d in diagnostics],
+        dtype=float,
+    )
+    dir_r = np.array(
+        [d["right_hand_dir_err_deg"] for d in diagnostics],
+        dtype=float,
+    )
+
+    palm_l = np.array(
+        [
+            d["left_palm_dir_err_deg"]
+            for d in diagnostics
+        ],
+        dtype=float,
+    )
+
+    palm_r = np.array(
+        [
+            d["right_palm_dir_err_deg"]
+            for d in diagnostics
+        ],
+        dtype=float,
+    )
+
+    prox_step = np.array(
+        [
+            d["max_proximal_step_rad"]
+            for d in diagnostics
+        ],
+        dtype=float,
+    )
+
+    distal_step = np.array(
+        [
+            d["max_distal_step_rad"]
+            for d in diagnostics
+        ],
+        dtype=float,
+    )
+
+    accel_step = np.array(
+        [
+            d["max_joint_accel_rad"]
+            for d in diagnostics
+        ],
+        dtype=float,
+    )
+
+    human_bend_l = np.array(
+        [d["left_human_elbow_bend_deg"] for d in diagnostics],
+        dtype=float,
+    )
+    human_bend_r = np.array(
+        [d["right_human_elbow_bend_deg"] for d in diagnostics],
+        dtype=float,
+    )
+    robot_elbow_l = np.array(
+        [d["left_robot_elbow_flex_rad"] for d in diagnostics],
+        dtype=float,
+    )
+    robot_elbow_r = np.array(
+        [d["right_robot_elbow_flex_rad"] for d in diagnostics],
+        dtype=float,
+    )
+    gate_l = np.array(
+        [d["left_extension_gate"] for d in diagnostics],
+        dtype=float,
+    )
+    gate_r = np.array(
+        [d["right_extension_gate"] for d in diagnostics],
+        dtype=float,
+    )
+
+    twist_dev_l = np.array(
+        [d["left_twist_posture_dev_rad"] for d in diagnostics],
+        dtype=float,
+    )
+    twist_dev_r = np.array(
+        [d["right_twist_posture_dev_rad"] for d in diagnostics],
+        dtype=float,
+    )
+
+    orientation_tiers = np.array(
+        [
+            d["orientation_tier"]
+            for d in diagnostics
+        ],
+        dtype=int,
+    )
+
+    contacts = np.array(
+        [
+            d["contact_count"]
+            for d in diagnostics
+        ],
+        dtype=int,
+    )
+
+    print()
+    print("=" * 80)
+    print("V3.3.4 summary")
+    print("=" * 80)
+    print(
+        "left wrist error : "
+        f"mean={wr_l.mean():.1f} mm "
+        f"max={wr_l.max():.1f} mm"
+    )
+    print(
+        "right wrist error: "
+        f"mean={wr_r.mean():.1f} mm "
+        f"max={wr_r.max():.1f} mm"
+    )
+    print(
+        "left hand direction error : "
+        f"mean={dir_l.mean():.1f} deg max={dir_l.max():.1f} deg"
+    )
+    print(
+        "right hand direction error: "
+        f"mean={dir_r.mean():.1f} deg max={dir_r.max():.1f} deg"
+    )
+    print(
+        "left palm direction error : "
+        f"mean={palm_l.mean():.1f} deg max={palm_l.max():.1f} deg"
+    )
+    print(
+        "right palm direction error: "
+        f"mean={palm_r.mean():.1f} deg max={palm_r.max():.1f} deg"
+    )
+    print(
+        "min hand-hand distance      : "
+        f"{hh.min():.4f} m"
+    )
+    print(
+        "min forearm-forearm distance: "
+        f"{ff.min():.4f} m"
+    )
+    print(
+        "min torso proxy clearance   : "
+        f"{tc.min():.4f} m"
+    )
+    print(
+        "max arm joint step          : "
+        f"{dq.max():.4f} rad/frame"
+    )
+    print(
+        "max proximal joint step       : "
+        f"{prox_step.max():.4f} rad/frame"
+    )
+    print(
+        "max distal joint step         : "
+        f"{distal_step.max():.4f} rad/frame"
+    )
+    print(
+        "max joint accel-like          : "
+        f"{accel_step.max():.4f} rad/frame"
+    )
+    print(
+        "orientation relaxation        : "
+        f"tier0={int(np.sum(orientation_tiers == 0))} "
+        f"tier1={int(np.sum(orientation_tiers == 1))} "
+        f"tier2={int(np.sum(orientation_tiers == 2))}"
+    )
+    print(
+        "twist-posture deviation      : "
+        f"L mean={twist_dev_l.mean():.3f} rad "
+        f"max={twist_dev_l.max():.3f} | "
+        f"R mean={twist_dev_r.mean():.3f} rad "
+        f"max={twist_dev_r.max():.3f}"
+    )
+    straight_l = human_bend_l <= args.elbow_extension_full_deg
+    straight_r = human_bend_r <= args.elbow_extension_full_deg
+    if np.any(straight_l):
+        print(
+            "LEFT straight-human J04     : "
+            f"mean={robot_elbow_l[straight_l].mean():.3f} rad "
+            f"max={robot_elbow_l[straight_l].max():.3f} rad "
+            f"frames={int(np.sum(straight_l))}"
+        )
+    if np.any(straight_r):
+        print(
+            "RIGHT straight-human J04    : "
+            f"mean={robot_elbow_r[straight_r].mean():.3f} rad "
+            f"max={robot_elbow_r[straight_r].max():.3f} rad "
+            f"frames={int(np.sum(straight_r))}"
+        )
+    print(
+        "extension guidance active    : "
+        f"L={int(np.sum(gate_l > 0.0))} "
+        f"R={int(np.sum(gate_r > 0.0))}"
+    )
+    print(
+        "frames with MuJoCo arm collision: "
+        f"{int(np.count_nonzero(contacts))}"
+        f"/{len(indices)}"
+    )
+    print(
+        "No post-hoc wrist delta or "
+        "joint-step clipping was applied."
+    )
+    print(
+        "CSV :",
+        out_csv,
+    )
+    print(
+        "DIAG:",
+        diag_csv,
+    )
+
+    if args.render:
+        print(
+            "Rendering:",
+            video_path,
+        )
+        render_motion(
+            out_qpos,
+            indices,
+            args.fps,
+            video_path,
+        )
+        print(
+            "VIDEO:",
+            video_path,
+        )
+
+
+if __name__ == "__main__":
+    main()
