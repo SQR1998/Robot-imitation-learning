@@ -96,3 +96,28 @@ That model is QingLong / AzureLoong, NOT LingLong 2.0.
 
 The AzureLoong V3.3.4 result is retained only as an algorithm checkpoint.
 All future competition retargeting should use LingLong2.0.
+
+## Internal motion format
+
+Current development standard:
+
+661 rows x 37 columns.
+
+MuJoCo qpos order:
+
+0. root_x
+1. root_y
+2. root_z
+3. root_qw
+4. root_qx
+5. root_qy
+6. root_qz
+
+7-36: LingLong 2.0 30 robot joints in model qpos order.
+
+This is the internal development format.
+It is NOT yet claimed to be the official competition submission schema.
+
+All retargeting, validation and rendering should operate on this
+37-D representation. A final exporter may later convert it to the
+competition-required schema if necessary.
