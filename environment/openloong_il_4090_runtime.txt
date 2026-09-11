@@ -1,0 +1,26 @@
+Python: 3.10.21 (main, Aug 27 2026, 14:42:07) [GCC 14.3.0]
+torch: 2.1.2+cu118
+mujoco: 3.12.0
+numpy: 1.22.3
+scipy: 1.11.4
+cv2: 4.11.0
+smplx: unknown
+
+Package metadata:
+torch: 2.1.2+cu118
+torchvision: 0.16.2+cu118
+torchaudio: 2.1.2+cu118
+mujoco: 3.12.0
+opencv-python: 4.11.0.86
+smplx: 0.1.28
+mink: 1.3.0
+mmcv: 1.5.0
+mmpose: 0.24.0
+pytorch3d: 0.7.8
+iopath: 0.1.10
+ultralytics: 8.2.40
+
+Torch CUDA: 11.8
+CUDA available: True
+GPU: NVIDIA GeForce RTX 4090
+GPU capability: (8, 9)
